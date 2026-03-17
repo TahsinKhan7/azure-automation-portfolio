@@ -1,6 +1,6 @@
 # Azure Automation Portfolio
 
-A collection of production-style scripts, templates and modules for Azure DevOps, Data Engineering and Cloud Platform operations. Built from real-world experience managing enterprise Azure environments — CI/CD pipelines, Databricks platform administration, ETL pipeline engineering, infrastructure as code, and platform monitoring.
+A collection of my production-style scripts, templates and modules for Azure DevOps, Data Engineering and Cloud Platform operations. Built from real-world experience managing enterprise Azure environments — CI/CD pipelines, Databricks platform and data engineering, ETL pipeline engineering, infrastructure as code, and platform monitoring.
 
 ## Contents
 
