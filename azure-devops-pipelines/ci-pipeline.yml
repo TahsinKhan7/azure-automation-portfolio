@@ -1,0 +1,96 @@
+# CI Pipeline - Build, Test, Lint, Publish Artifacts
+# Triggers on main and feature branches with quality gates
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+  paths:
+    exclude:
+      - '*.md'
+      - docs/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  pythonVersion: '3.10'
+  artifactName: 'build-artifacts'
+
+stages:
+
+  - stage: Build
+    displayName: 'Build & Validate'
+    jobs:
+      - job: BuildAndTest
+        displayName: 'Build, Lint & Test'
+        steps:
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+            displayName: 'Set Python version'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install flake8 pytest pytest-cov
+            displayName: 'Install dependencies'
+
+          - script: |
+              flake8 src/ --max-line-length=120 --statistics
+            displayName: 'Lint - flake8'
+            continueOnError: false
+
+          - script: |
+              pytest tests/ \
+                --junitxml=test-results.xml \
+                --cov=src \
+                --cov-report=xml:coverage.xml \
+                --cov-fail-under=80
+            displayName: 'Run unit tests with coverage'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'test-results.xml'
+            displayName: 'Publish test results'
+            condition: always()
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: 'coverage.xml'
+            displayName: 'Publish coverage'
+            condition: always()
+
+          # Quality gate - fail if coverage below threshold
+          - script: |
+              python -c "
+              import xml.etree.ElementTree as ET
+              tree = ET.parse('coverage.xml')
+              rate = float(tree.getroot().attrib['line-rate']) * 100
+              print(f'Coverage: {rate:.1f}%')
+              if rate < 80:
+                  raise SystemExit(f'Coverage {rate:.1f}% below 80% threshold')
+              "
+            displayName: 'Quality gate - coverage check'
+
+  - stage: Package
+    displayName: 'Package Artifacts'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: PublishArtifacts
+        steps:
+          - task: CopyFiles@2
+            inputs:
+              sourceFolder: '$(Build.SourcesDirectory)/src'
+              contents: '**'
+              targetFolder: '$(Build.ArtifactStagingDirectory)/src'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)'
+              artifactName: '$(artifactName)'
+            displayName: 'Publish build artifacts'

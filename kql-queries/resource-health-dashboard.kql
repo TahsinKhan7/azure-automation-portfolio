@@ -1,0 +1,72 @@
+// ============================================================
+// Resource Health Dashboard
+// Platform health monitoring across compute, storage, networking
+// and Databricks workspaces
+// ============================================================
+
+// --- VM/Compute availability (last 7 days) ---
+Heartbeat
+| where TimeGenerated > ago(7d)
+| summarize
+    LastHeartbeat = max(TimeGenerated),
+    HeartbeatCount = count()
+    by Computer, ResourceGroup, SubscriptionId
+| extend
+    MinutesSinceLastHeartbeat = datetime_diff('minute', now(), LastHeartbeat),
+    Status = iff(datetime_diff('minute', now(), LastHeartbeat) > 10, "Offline", "Online")
+| order by Status asc, MinutesSinceLastHeartbeat desc
+
+// --- Azure resource health events ---
+AzureActivity
+| where TimeGenerated > ago(24h)
+| where CategoryValue == "ResourceHealth"
+| project
+    TimeGenerated,
+    ResourceGroup,
+    Resource = tostring(parse_json(Properties).resource),
+    Status = tostring(parse_json(Properties).currentHealthStatus),
+    PreviousStatus = tostring(parse_json(Properties).previousHealthStatus),
+    Cause = tostring(parse_json(Properties).cause)
+| order by TimeGenerated desc
+
+// --- Storage account throttling and errors ---
+StorageBlobLogs
+| where TimeGenerated > ago(24h)
+| where StatusCode >= 400
+| summarize
+    ErrorCount = count(),
+    ThrottledRequests = countif(StatusCode == 429 or StatusCode == 503)
+    by AccountName, StatusCode, StatusText, bin(TimeGenerated, 1h)
+| order by ErrorCount desc
+
+// --- Databricks cluster utilisation ---
+DatabricksClusterLibEvent
+| where TimeGenerated > ago(7d)
+| summarize
+    EventCount = count()
+    by ClusterId, ActionName, bin(TimeGenerated, 1d)
+| order by TimeGenerated desc
+
+// --- Key Vault access and errors ---
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.KEYVAULT"
+| where TimeGenerated > ago(24h)
+| where ResultType != "Success"
+| project
+    TimeGenerated,
+    OperationName,
+    ResultType,
+    ResultDescription,
+    CallerIPAddress,
+    Resource
+| order by TimeGenerated desc
+
+// --- NSG flow log summary - denied traffic ---
+AzureNetworkAnalytics_CL
+| where TimeGenerated > ago(24h)
+| where FlowStatus_s == "D"  // Denied
+| summarize
+    DeniedFlows = count()
+    by NSGRule_s, DestPort_d, SrcIP_s, bin(TimeGenerated, 1h)
+| where DeniedFlows > 10
+| order by DeniedFlows desc

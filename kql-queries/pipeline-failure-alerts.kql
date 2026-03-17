@@ -1,0 +1,69 @@
+// ============================================================
+// Pipeline Failure Alerts
+// Monitors Azure Data Factory and CI/CD pipeline failures
+// Use in Azure Monitor alert rules or Log Analytics dashboards
+// ============================================================
+
+// --- ADF Pipeline Failures (last 24 hours) ---
+ADFPipelineRun
+| where TimeGenerated > ago(24h)
+| where Status == "Failed"
+| project
+    TimeGenerated,
+    PipelineName,
+    Status,
+    ErrorMessage = tostring(parse_json(Error)[0].Message),
+    DurationMs = datetime_diff('millisecond', End, Start),
+    RunId
+| order by TimeGenerated desc
+
+// --- ADF Pipeline failure rate by hour ---
+ADFPipelineRun
+| where TimeGenerated > ago(7d)
+| summarize
+    Total = count(),
+    Failed = countif(Status == "Failed"),
+    Succeeded = countif(Status == "Succeeded")
+    by bin(TimeGenerated, 1h)
+| extend FailureRate = round(toreal(Failed) / Total * 100, 1)
+| order by TimeGenerated desc
+
+// --- ADF Activity-level errors (drill-down) ---
+ADFActivityRun
+| where TimeGenerated > ago(24h)
+| where Status == "Failed"
+| project
+    TimeGenerated,
+    PipelineName,
+    ActivityName,
+    ActivityType,
+    ErrorMessage = tostring(parse_json(Error)[0].Message),
+    DurationMs = datetime_diff('millisecond', End, Start)
+| order by TimeGenerated desc
+
+// --- Long-running ADF pipelines (over 2 hours) ---
+ADFPipelineRun
+| where TimeGenerated > ago(24h)
+| where Status == "InProgress" or Status == "Succeeded"
+| extend DurationMinutes = datetime_diff('minute', coalesce(End, now()), Start)
+| where DurationMinutes > 120
+| project
+    TimeGenerated,
+    PipelineName,
+    Status,
+    DurationMinutes,
+    Start,
+    End
+| order by DurationMinutes desc
+
+// --- ADF trigger failures ---
+ADFTriggerRun
+| where TimeGenerated > ago(24h)
+| where Status == "Failed"
+| project
+    TimeGenerated,
+    TriggerName,
+    TriggerType,
+    Status,
+    ErrorMessage = tostring(parse_json(Message))
+| order by TimeGenerated desc

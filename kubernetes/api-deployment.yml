@@ -1,0 +1,134 @@
+---
+# Data API Deployment
+# Containerised API for data platform operations
+# Includes health probes, resource limits and rolling update strategy
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-api
+  namespace: data-platform
+  labels:
+    app: data-api
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: data-api
+        tier: backend
+    spec:
+      serviceAccountName: data-api-sa
+      containers:
+        - name: data-api
+          image: acrdataprod.azurecr.io/data-api:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: data-api-config
+                  key: ENVIRONMENT
+            - name: DATABRICKS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: data-api-config
+                  key: DATABRICKS_HOST
+            - name: DATABRICKS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: data-api-secrets
+                  key: databricks-token
+            - name: SQL_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: data-api-secrets
+                  key: sql-connection-string
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: keyvault-secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+      volumes:
+        - name: keyvault-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: azure-keyvault-data-api
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-api-svc
+  namespace: data-platform
+  labels:
+    app: data-api
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: data-api
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-api-hpa
+  namespace: data-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: data-api
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

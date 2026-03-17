@@ -1,0 +1,119 @@
+# Azure Data Factory ARM Template Deployment Pipeline
+# Deploys ADF resources via ARM templates with pre/post deployment scripts
+# Handles linked service connections, triggers and pipeline definitions
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - data-factory/**
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: environment
+    type: string
+    default: 'dev'
+    values: [dev, prod]
+
+variables:
+  - group: 'adf-${{ parameters.environment }}'
+
+stages:
+
+  - stage: ValidateADF
+    displayName: 'Validate ADF Templates'
+    jobs:
+      - job: Validate
+        steps:
+          - task: AzureResourceManagerTemplateDeployment@3
+            inputs:
+              azureResourceManagerConnection: '$(azureServiceConnection)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: '$(resourceGroup)'
+              location: '$(location)'
+              templateLocation: 'Linked artifact'
+              csmFile: 'data-factory/arm-template/ARMTemplateForFactory.json'
+              csmParametersFile: 'data-factory/arm-template/ARMTemplateParametersForFactory.json'
+              overrideParameters: '-factoryName $(adfName) -dataLake_accountKey $(dataLakeKey)'
+              deploymentMode: 'Validation'
+            displayName: 'Validate ARM template'
+
+  - stage: DeployADF
+    displayName: 'Deploy ADF (${{ parameters.environment }})'
+    dependsOn: ValidateADF
+    jobs:
+      - deployment: DeployFactory
+        environment: 'adf-${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Pre-deployment: stop triggers
+                - task: AzurePowerShell@5
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    ScriptType: 'InlineScript'
+                    Inline: |
+                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
+                      foreach ($trigger in $triggers) {
+                        if ($trigger.RuntimeState -eq "Started") {
+                          Stop-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) `
+                            -DataFactoryName $(adfName) -Name $trigger.Name -Force
+                          Write-Host "Stopped trigger: $($trigger.Name)"
+                        }
+                      }
+                    azurePowerShellVersion: 'LatestVersion'
+                  displayName: 'Pre-deploy: Stop triggers'
+
+                # Deploy ARM template
+                - task: AzureResourceManagerTemplateDeployment@3
+                  inputs:
+                    azureResourceManagerConnection: '$(azureServiceConnection)'
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: '$(resourceGroup)'
+                    location: '$(location)'
+                    templateLocation: 'Linked artifact'
+                    csmFile: 'data-factory/arm-template/ARMTemplateForFactory.json'
+                    csmParametersFile: 'data-factory/arm-template/ARMTemplateParametersForFactory.json'
+                    overrideParameters: >-
+                      -factoryName $(adfName)
+                      -dataLake_accountKey $(dataLakeKey)
+                      -sqlServer_connectionString $(sqlConnectionString)
+                      -databricks_accessToken $(databricksToken)
+                    deploymentMode: 'Incremental'
+                  displayName: 'Deploy ADF ARM template'
+
+                # Post-deployment: restart triggers
+                - task: AzurePowerShell@5
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    ScriptType: 'InlineScript'
+                    Inline: |
+                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
+                      foreach ($trigger in $triggers) {
+                        if ($trigger.RuntimeState -eq "Stopped") {
+                          Start-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) `
+                            -DataFactoryName $(adfName) -Name $trigger.Name -Force
+                          Write-Host "Started trigger: $($trigger.Name)"
+                        }
+                      }
+                    azurePowerShellVersion: 'LatestVersion'
+                  displayName: 'Post-deploy: Restart triggers'
+
+                # Verify deployment
+                - task: AzurePowerShell@5
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    ScriptType: 'InlineScript'
+                    Inline: |
+                      $pipelines = Get-AzDataFactoryV2Pipeline -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
+                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
+                      Write-Host "Deployed: $($pipelines.Count) pipelines, $($triggers.Count) triggers"
+                    azurePowerShellVersion: 'LatestVersion'
+                  displayName: 'Verify deployment'

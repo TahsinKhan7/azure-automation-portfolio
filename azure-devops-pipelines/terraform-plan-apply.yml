@@ -1,0 +1,118 @@
+# Terraform Plan & Apply Pipeline
+# IaC deployment with plan output, manual approval, then apply
+# Supports multi-environment via variable groups and tfvars
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: environment
+    type: string
+    default: 'dev'
+    values: [dev, prod]
+  - name: action
+    type: string
+    default: 'plan'
+    values: [plan, apply, destroy]
+
+variables:
+  - group: 'terraform-${{ parameters.environment }}'
+  - name: tfWorkingDir
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+  - name: tfVarsFile
+    value: 'environments/${{ parameters.environment }}.tfvars'
+  - name: tfBackendKey
+    value: '${{ parameters.environment }}.terraform.tfstate'
+
+stages:
+
+  - stage: TerraformPlan
+    displayName: 'Terraform Plan (${{ parameters.environment }})'
+    jobs:
+      - job: Plan
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+            displayName: 'Install Terraform'
+
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(tfWorkingDir)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(tfStateRg)'
+              backendAzureRmStorageAccountName: '$(tfStateStorage)'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: '$(tfBackendKey)'
+            displayName: 'Terraform Init'
+
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(tfWorkingDir)'
+            displayName: 'Terraform Validate'
+
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(tfWorkingDir)'
+              commandOptions: '-var-file=$(tfVarsFile) -out=tfplan -detailed-exitcode'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+            displayName: 'Terraform Plan'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(tfWorkingDir)/tfplan'
+              artifactName: 'terraform-plan'
+            displayName: 'Publish plan artifact'
+
+  - stage: TerraformApply
+    displayName: 'Terraform Apply (${{ parameters.environment }})'
+    dependsOn: TerraformPlan
+    condition: and(succeeded(), eq('${{ parameters.action }}', 'apply'))
+    jobs:
+      - deployment: Apply
+        environment: 'terraform-${{ parameters.environment }}'  # Manual approval gate
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'terraform-plan'
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - task: TerraformTaskV4@4
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(tfWorkingDir)'
+                    backendServiceArm: '$(azureServiceConnection)'
+                    backendAzureRmResourceGroupName: '$(tfStateRg)'
+                    backendAzureRmStorageAccountName: '$(tfStateStorage)'
+                    backendAzureRmContainerName: 'tfstate'
+                    backendAzureRmKey: '$(tfBackendKey)'
+                  displayName: 'Terraform Init'
+
+                - task: TerraformTaskV4@4
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(tfWorkingDir)'
+                    commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplan'
+                    environmentServiceNameAzureRM: '$(azureServiceConnection)'
+                  displayName: 'Terraform Apply'

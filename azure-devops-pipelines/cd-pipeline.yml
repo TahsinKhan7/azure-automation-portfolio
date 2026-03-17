@@ -1,0 +1,119 @@
+# CD Pipeline - Deploy to Dev, Staging, Production
+# Multi-stage with approval gates and environment-specific configs
+
+trigger: none
+
+resources:
+  pipelines:
+    - pipeline: ci-build
+      source: 'CI Pipeline'
+      trigger:
+        branches:
+          include:
+            - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: 'common-variables'
+
+stages:
+
+  - stage: DeployDev
+    displayName: 'Deploy to Dev'
+    variables:
+      - group: 'dev-variables'
+    jobs:
+      - deployment: DeployDevJob
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: ci-build
+                  artifact: 'build-artifacts'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "Deploying to Dev environment..."
+                      az webapp deploy \
+                        --resource-group $(resourceGroup) \
+                        --name $(appServiceName) \
+                        --src-path $(Pipeline.Workspace)/ci-build/build-artifacts/src
+                  displayName: 'Deploy to Dev App Service'
+
+                - script: |
+                    echo "Running smoke tests against Dev..."
+                    curl -f https://$(appServiceName).azurewebsites.net/health || exit 1
+                  displayName: 'Smoke test'
+
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: DeployDev
+    condition: succeeded()
+    variables:
+      - group: 'staging-variables'
+    jobs:
+      - deployment: DeployStagingJob
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: ci-build
+                  artifact: 'build-artifacts'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    inlineScript: |
+                      echo "Deploying to Staging..."
+                      az webapp deploy \
+                        --resource-group $(resourceGroup) \
+                        --name $(appServiceName) \
+                        --src-path $(Pipeline.Workspace)/ci-build/build-artifacts/src
+                  displayName: 'Deploy to Staging'
+
+                - script: |
+                    echo "Running integration tests..."
+                    pytest tests/integration/ --junitxml=integration-results.xml
+                  displayName: 'Integration tests'
+
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: DeployStaging
+    condition: succeeded()
+    variables:
+      - group: 'prod-variables'
+    jobs:
+      - deployment: DeployProdJob
+        environment: 'production'  # Requires manual approval in Azure DevOps
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: ci-build
+                  artifact: 'build-artifacts'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    inlineScript: |
+                      echo "Deploying to Production..."
+                      az webapp deploy \
+                        --resource-group $(resourceGroup) \
+                        --name $(appServiceName) \
+                        --src-path $(Pipeline.Workspace)/ci-build/build-artifacts/src
+                  displayName: 'Deploy to Production'
+
+                - script: |
+                    echo "Production smoke test..."
+                    curl -f https://$(appServiceName).azurewebsites.net/health || exit 1
+                  displayName: 'Production health check'

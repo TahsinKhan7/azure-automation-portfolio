@@ -1,0 +1,60 @@
+// ============================================================
+// Cost Anomaly Detection
+// Detects unusual Azure spend patterns and resource provisioning
+// Use with Azure Monitor alerts for proactive FinOps
+// ============================================================
+
+// --- Daily cost by resource group (trend) ---
+AzureActivity
+| where TimeGenerated > ago(30d)
+| where OperationNameValue has "Microsoft.Resources/deployments/write"
+| summarize DeploymentCount = count() by ResourceGroup, bin(TimeGenerated, 1d)
+| order by TimeGenerated desc
+
+// --- Unusual resource creation spikes ---
+AzureActivity
+| where TimeGenerated > ago(7d)
+| where ActivityStatusValue == "Success"
+| where OperationNameValue endswith "/write"
+| summarize CreatedResources = count() by Caller, ResourceGroup, bin(TimeGenerated, 1h)
+| where CreatedResources > 10
+| order by CreatedResources desc
+
+// --- Compute-heavy resource provisioning (VMs, clusters) ---
+AzureActivity
+| where TimeGenerated > ago(24h)
+| where OperationNameValue in (
+    "Microsoft.Compute/virtualMachines/write",
+    "Microsoft.Databricks/workspaces/write",
+    "Microsoft.ContainerService/managedClusters/write"
+)
+| project
+    TimeGenerated,
+    Caller,
+    ResourceGroup,
+    ResourceId = tostring(parse_json(Properties).resource),
+    OperationNameValue,
+    ActivityStatusValue
+| order by TimeGenerated desc
+
+// --- Storage account size growth (potential cost impact) ---
+StorageBlobLogs
+| where TimeGenerated > ago(7d)
+| where OperationName == "PutBlob" or OperationName == "PutBlock"
+| summarize
+    WriteOps = count(),
+    TotalBytesWritten = sum(RequestBodySize)
+    by AccountName, bin(TimeGenerated, 1d)
+| extend GBWritten = round(toreal(TotalBytesWritten) / 1073741824, 2)
+| order by GBWritten desc
+
+// --- Subscription-level spend alerts ---
+// Note: Requires Cost Management data exported to Log Analytics
+Usage
+| where TimeGenerated > ago(30d)
+| summarize DailyCost = sum(Quantity * EffectivePrice) by bin(TimeGenerated, 1d)
+| extend
+    AvgCost = avg_over_time(DailyCost, 7d),
+    Anomaly = iff(DailyCost > 1.5 * avg_over_time(DailyCost, 7d), true, false)
+| where Anomaly == true
+| project TimeGenerated, DailyCost, AvgCost

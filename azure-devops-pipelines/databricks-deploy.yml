@@ -1,0 +1,118 @@
+# Databricks Deployment Pipeline
+# Deploys notebooks, jobs and libraries to Databricks workspaces
+# Supports dev/prod workspace promotion via Databricks CLI and REST API
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - databricks/**
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: environment
+    displayName: 'Target Environment'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - prod
+
+variables:
+  - name: workspaceUrl
+    ${{ if eq(parameters.environment, 'prod') }}:
+      value: 'https://adb-prod.azuredatabricks.net'
+    ${{ else }}:
+      value: 'https://adb-dev.azuredatabricks.net'
+  - group: 'databricks-${{ parameters.environment }}'
+
+stages:
+
+  - stage: ValidateNotebooks
+    displayName: 'Validate Notebooks'
+    jobs:
+      - job: Validate
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+
+          - script: |
+              pip install databricks-cli pyspark flake8
+            displayName: 'Install tools'
+
+          - script: |
+              echo "Linting PySpark notebooks..."
+              find databricks/notebooks -name "*.py" -exec flake8 {} --max-line-length=120 \;
+            displayName: 'Lint notebooks'
+
+          - script: |
+              echo "Validating job definitions..."
+              for f in databricks/jobs/*.json; do
+                python -c "import json; json.load(open('$f'))" && echo "  Valid: $f" || exit 1
+              done
+            displayName: 'Validate job JSON configs'
+
+  - stage: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    dependsOn: ValidateNotebooks
+    jobs:
+      - deployment: DeployDatabricks
+        environment: '${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Upload notebooks to workspace
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    inlineScript: |
+                      TOKEN=$(az account get-access-token \
+                        --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d \
+                        --query accessToken -o tsv)
+
+                      echo "Uploading notebooks to $(workspaceUrl)..."
+                      for nb in databricks/notebooks/*.py; do
+                        FILENAME=$(basename "$nb" .py)
+                        CONTENT=$(base64 -w 0 "$nb")
+                        
+                        curl -s -X POST "$(workspaceUrl)/api/2.0/workspace/import" \
+                          -H "Authorization: Bearer $TOKEN" \
+                          -H "Content-Type: application/json" \
+                          -d "{
+                            \"path\": \"/Shared/deployed/$FILENAME\",
+                            \"format\": \"SOURCE\",
+                            \"language\": \"PYTHON\",
+                            \"content\": \"$CONTENT\",
+                            \"overwrite\": true
+                          }"
+                        echo "  Deployed: $FILENAME"
+                      done
+                  displayName: 'Deploy notebooks'
+
+                # Create/update jobs
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    inlineScript: |
+                      TOKEN=$(az account get-access-token \
+                        --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d \
+                        --query accessToken -o tsv)
+
+                      for job_file in databricks/jobs/*.json; do
+                        echo "Deploying job: $job_file"
+                        curl -s -X POST "$(workspaceUrl)/api/2.1/jobs/create" \
+                          -H "Authorization: Bearer $TOKEN" \
+                          -H "Content-Type: application/json" \
+                          -d @"$job_file"
+                      done
+                  displayName: 'Deploy jobs'

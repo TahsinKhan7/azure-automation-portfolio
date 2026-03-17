@@ -1,0 +1,79 @@
+# ============================================================
+# Horizontal Pod Autoscaler & Pod Disruption Budget
+# Auto-scales data API pods based on CPU/memory utilisation
+# and ensures availability during cluster maintenance
+# ============================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-api-hpa
+  namespace: data-platform
+  labels:
+    app.kubernetes.io/part-of: data-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: data-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+
+# Pod Disruption Budget - maintain at least 1 pod during rolling updates
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: data-api-pdb
+  namespace: data-platform
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: data-api
+
+---
+
+# ServiceMonitor for Prometheus (if using kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: data-api-monitor
+  namespace: data-platform
+  labels:
+    app.kubernetes.io/part-of: data-platform
+spec:
+  selector:
+    matchLabels:
+      app: data-api
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
