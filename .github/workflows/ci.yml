@@ -425,27 +425,18 @@ jobs:
         shell: pwsh
         run: |
           $settings = 'powershell/PSScriptAnalyzerSettings.psd1'
-          $params = @{ Path = 'powershell'; Recurse = $true; Severity = @('Error', 'Warning') }
+          $params = @{ Path = 'powershell'; Severity = 'Error,Warning' }
           if (Test-Path $settings) {
             $params.Settings = $settings
           } else {
             Write-Warning "Settings file ${settings} not found; using default rules."
           }
 
-          # PSScriptAnalyzer has a long-standing intermittent NullReferenceException raised from
-          # CommandInfo parameter resolution while rules run in parallel
-          # (PowerShell/PSScriptAnalyzer#1351, still present in 1.25.0). Results are deterministic
-          # when the run completes, so retry the analysis itself rather than ignore the crash.
-          $results = $null
-          foreach ($attempt in 1..3) {
-            try {
-              $results = @(Invoke-ScriptAnalyzer @params -ErrorAction Stop)
-              break
-            } catch {
-              if ($attempt -eq 3) { throw }
-              Write-Warning "PSScriptAnalyzer attempt ${attempt} failed ($($_.Exception.Message)); retrying."
-            }
-          }
+          # PSScriptAnalyzer crashes intermittently while resolving command metadata in parallel
+          # (PowerShell/PSScriptAnalyzer#1351, still present in 1.25.0), and the broken state
+          # persists for the life of the process. The helper runs each attempt in a fresh pwsh
+          # process and returns the first complete set of findings unchanged.
+          $results = @(& ./scripts/ci/Invoke-ScriptAnalyzerWithRetry.ps1 @params)
           foreach ($r in $results) {
             $file = [System.IO.Path]::GetRelativePath((Get-Location).Path, $r.ScriptPath)
             $level = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
