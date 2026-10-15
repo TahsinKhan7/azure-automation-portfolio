@@ -76,12 +76,9 @@ class TokenRotator:
         )
         new_id = created.token_info.token_id
         expires_at = now + timedelta(days=lifetime_days)
-        # Token identifiers stay out of log output; the RotationResult carries them.
-        logger.info(
-            "Created replacement token for secret '%s' (expires %s)",
-            secret_name,
-            expires_at.date(),
-        )
+        # Log lines carry no token identifiers and no Key Vault secret names; the
+        # RotationResult returned to the caller carries both for reporting.
+        logger.info("Created replacement token (expires %s)", expires_at.date())
 
         try:
             self.secrets.set_secret(
@@ -92,9 +89,7 @@ class TokenRotator:
                 tags={"rotated_at": now.isoformat(), "token_id": new_id},
             )
         except Exception:
-            logger.exception(
-                "Key Vault write failed for '%s'; revoking freshly created token", secret_name
-            )
+            logger.exception("Key Vault write failed; revoking freshly created token")
             self.w.tokens.delete(token_id=new_id)
             raise
 
@@ -104,12 +99,7 @@ class TokenRotator:
                 continue
             self.w.tokens.delete(token_id=token_id)
             revoked.append(token_id)
-            logger.info(
-                "Revoked previous token %d of %d for secret '%s'",
-                len(revoked),
-                len(previous_ids),
-                secret_name,
-            )
+            logger.info("Revoked previous token %d of %d", len(revoked), len(previous_ids))
 
         return RotationResult(secret_name, new_id, tuple(revoked), expires_at)
 
