@@ -1,0 +1,84 @@
+# Databricks Jobs 2.1 definitions deployed by `dataplatform jobs deploy`.
+# Placeholders in {braces} are substituted from the environment settings at deploy time.
+jobs:
+  - name: "dataplatform-{environment}-medallion-claims"
+    tags:
+      platform: dataplatform
+      environment: "{environment}"
+      dataset: claims
+    max_concurrent_runs: 1
+    timeout_seconds: 10800
+    schedule:
+      quartz_cron_expression: "0 0 2 * * ?"
+      timezone_id: Europe/London
+      pause_status: UNPAUSED
+    email_notifications:
+      on_failure: ["dataplatform-alerts@example.com"]
+      no_alert_for_skipped_runs: true
+    job_clusters:
+      - job_cluster_key: medallion_cluster
+        new_cluster:
+          spark_version: "{spark_version}"
+          node_type_id: "{node_type_id}"
+          autoscale:
+            min_workers: "{min_workers}"
+            max_workers: "{max_workers}"
+          runtime_engine: PHOTON
+          data_security_mode: SINGLE_USER
+          spark_conf:
+            spark.sql.shuffle.partitions: "{shuffle_partitions}"
+          custom_tags:
+            platform: dataplatform
+            environment: "{environment}"
+    tasks:
+      - task_key: landing_to_bronze
+        job_cluster_key: medallion_cluster
+        notebook_task:
+          notebook_path: /Workspace/Shared/dataplatform/notebooks/01_landing_to_bronze
+          base_parameters: { env: "{environment}", dataset: claims }
+        max_retries: 1
+        min_retry_interval_millis: 60000
+      - task_key: bronze_to_silver
+        depends_on: [{ task_key: landing_to_bronze }]
+        job_cluster_key: medallion_cluster
+        notebook_task:
+          notebook_path: /Workspace/Shared/dataplatform/notebooks/02_bronze_to_silver
+          base_parameters: { env: "{environment}", dataset: claims }
+        max_retries: 1
+      - task_key: data_quality_gate
+        depends_on: [{ task_key: bronze_to_silver }]
+        job_cluster_key: medallion_cluster
+        notebook_task:
+          notebook_path: /Workspace/Shared/dataplatform/notebooks/04_data_quality_gate
+          base_parameters: { env: "{environment}", dataset: claims, layer: silver }
+      - task_key: silver_to_gold
+        depends_on: [{ task_key: data_quality_gate }]
+        job_cluster_key: medallion_cluster
+        notebook_task:
+          notebook_path: /Workspace/Shared/dataplatform/notebooks/03_silver_to_gold
+          base_parameters: { env: "{environment}", dataset: claims }
+        max_retries: 1
+
+  - name: "dataplatform-{environment}-delta-maintenance"
+    tags:
+      platform: dataplatform
+      environment: "{environment}"
+    max_concurrent_runs: 1
+    schedule:
+      quartz_cron_expression: "0 0 4 ? * SUN"
+      timezone_id: Europe/London
+      pause_status: UNPAUSED
+    job_clusters:
+      - job_cluster_key: maintenance_cluster
+        new_cluster:
+          spark_version: "{spark_version}"
+          node_type_id: "{node_type_id}"
+          num_workers: 2
+          runtime_engine: PHOTON
+          data_security_mode: SINGLE_USER
+    tasks:
+      - task_key: optimize_and_vacuum
+        job_cluster_key: maintenance_cluster
+        notebook_task:
+          notebook_path: /Workspace/Shared/dataplatform/notebooks/06_delta_maintenance
+          base_parameters: { env: "{environment}", dry_run: "false" }

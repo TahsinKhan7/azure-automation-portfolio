@@ -1,0 +1,29 @@
+# dataplatform configuration: prod
+# Non-secret settings only. Secrets (tokens, connection strings) come from Key Vault
+# via the Databricks secret scope or DefaultAzureCredential at runtime.
+environment: prod
+workspace_host: https://adb-0000000000000000.0.azuredatabricks.net
+key_vault_name: kv-dataplatform-prod
+catalog: dataplatform_prod
+
+storage:
+  account_name: stdataplatformprod
+  containers:
+    landing: landing
+    bronze: bronze
+    silver: silver
+    gold: gold
+    quarantine: quarantine
+    checkpoints: checkpoints
+
+job:
+  shuffle_partitions: 200
+  max_retries: 3
+  timeout_minutes: 240
+  delta_retention_hours: 720
+  use_spot_instances: false
+  min_workers: 2
+  max_workers: 12
+  cluster_policy_name: dataplatform-prod-jobs
+  spark_version: 15.4.x-scala2.12
+  node_type_id: Standard_D4ds_v5
