@@ -1,0 +1,33 @@
+# yamllint configuration for the whole repository.
+# Run locally with:  yamllint -c .yamllint.yml .
+extends: default
+
+ignore: |
+  .terraform/
+  arm-ttk/
+  node_modules/
+  .venv/
+  venv/
+
+rules:
+  # GitHub Actions and Azure Pipelines keys such as `on:` are not booleans,
+  # so "on"/"yes"/"no"/"off" must be allowed as plain keys.
+  truthy:
+    allowed-values: ["true", "false", "on", "off", "yes", "no"]
+    check-keys: false
+  document-start: disable
+  line-length:
+    max: 140
+    level: warning
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1

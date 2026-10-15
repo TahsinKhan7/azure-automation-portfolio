@@ -1,0 +1,181 @@
+# =============================================================================
+# dataplatform-dab : validate and deploy the Databricks Asset Bundle
+# -----------------------------------------------------------------------------
+# The bundle in databricks-bundles/ declares jobs, pipelines and the wheel it
+# depends on. Pull requests run `bundle validate` for every target; pushes to
+# main validate, then deploy target by target (dev -> ite -> iqe -> preprod ->
+# prod) with approvals on the dataplatform-<env> Environments.
+#
+# Authentication is the per-environment workload-identity service connection;
+# the Databricks CLI picks it up with DATABRICKS_AUTH_TYPE=azure-cli.
+# =============================================================================
+name: dab-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - databricks-bundles/**
+      - python/**
+      - azure-devops-pipelines/databricks-bundle-deploy.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - databricks-bundles/**
+      - python/**
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: environments
+    displayName: Bundle targets in promotion order
+    type: object
+    default:
+      - name: dev
+        serviceConnection: sc-dataplatform-dev
+        dependsOn: [Validate]
+      - name: ite
+        serviceConnection: sc-dataplatform-ite
+        dependsOn: [Deploy_dev]
+      - name: iqe
+        serviceConnection: sc-dataplatform-iqe
+        dependsOn: [Deploy_ite]
+      - name: preprod
+        serviceConnection: sc-dataplatform-preprod
+        dependsOn: [Deploy_iqe]
+      - name: prod
+        serviceConnection: sc-dataplatform-prod
+        dependsOn: [Deploy_preprod]
+  - name: deploy
+    displayName: Deploy after validation (unticked = validate only)
+    type: boolean
+    default: true
+  - name: runJobKey
+    displayName: Bundle job resource key to run after each deployment (blank = none)
+    type: string
+    default: ''
+  - name: pythonVersion
+    type: string
+    default: '3.11'
+
+variables:
+  - name: bundleDir
+    value: $(Build.SourcesDirectory)/databricks-bundles
+  - name: DATABRICKS_AUTH_TYPE
+    value: azure-cli
+  - name: DATABRICKS_BUNDLE_ENV_INHERIT
+    value: 'true'
+
+stages:
+  # ---------------------------------------------------------------------------
+  # Validate every target with its own identity. Runs for PRs and for main.
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: Validate bundle (all targets)
+    jobs:
+      - job: Validate
+        displayName: databricks bundle validate
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - bash: scripts/ci/install-databricks-cli.sh
+            displayName: Install Databricks CLI (pinned, checksum verified)
+
+          - ${{ each env in parameters.environments }}:
+              - task: AzureCLI@2
+                displayName: validate -t ${{ env.name }}
+                inputs:
+                  azureSubscription: ${{ env.serviceConnection }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: $(bundleDir)
+                  addSpnToEnvironment: true
+                  inlineScript: |
+                    set -euo pipefail
+                    databricks bundle validate -t ${{ env.name }} --output json > "$(Agent.TempDirectory)/validate-${{ env.name }}.json"
+                    jq -r '"Target ${{ env.name }}: workspace " + .workspace.host + ", root " + .workspace.root_path' \
+                      "$(Agent.TempDirectory)/validate-${{ env.name }}.json"
+
+  # ---------------------------------------------------------------------------
+  # Deploy target by target. Each stage waits for the Environment's checks.
+  # ---------------------------------------------------------------------------
+  - ${{ if eq(parameters.deploy, true) }}:
+      - ${{ each env in parameters.environments }}:
+          - stage: Deploy_${{ env.name }}
+            displayName: Deploy bundle to ${{ env.name }}
+            dependsOn: ${{ env.dependsOn }}
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            jobs:
+              - deployment: Deploy
+                displayName: bundle deploy -t ${{ env.name }}
+                environment: dataplatform-${{ env.name }}
+                timeoutInMinutes: 45
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                          fetchDepth: 1
+
+                        - task: UsePythonVersion@0
+                          displayName: Use Python ${{ parameters.pythonVersion }} (wheel build)
+                          inputs:
+                            versionSpec: ${{ parameters.pythonVersion }}
+
+                        - bash: |
+                            set -euo pipefail
+                            python -m pip install --upgrade pip build
+                            scripts/ci/install-databricks-cli.sh
+                          displayName: Install build tooling and Databricks CLI
+
+                        - task: AzureCLI@2
+                          displayName: databricks bundle deploy -t ${{ env.name }}
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            scriptType: bash
+                            scriptLocation: inlineScript
+                            workingDirectory: $(bundleDir)
+                            addSpnToEnvironment: true
+                            inlineScript: |
+                              set -euo pipefail
+                              databricks bundle validate -t ${{ env.name }}
+                              # --auto-approve answers the destructive-change prompt non-interactively;
+                              # the human gate is the Environment approval on this stage.
+                              databricks bundle deploy -t ${{ env.name }} --auto-approve
+                              summary="$(Agent.TempDirectory)/summary-${{ env.name }}.json"
+                              databricks bundle summary -t ${{ env.name }} --output json > "$summary"
+                              {
+                                echo "## Bundle deployed to ${{ env.name }}"
+                                echo
+                                echo "- Commit: $(Build.SourceVersion)"
+                                echo "- Run: $(Build.BuildNumber)"
+                                echo
+                                echo "| Resource | URL |"
+                                echo "|---|---|"
+                                jq -r '.resources // {} | to_entries[] | .key as $kind | .value | to_entries[] |
+                                       "| \($kind)/\(.key) | \(.value.url // "n/a") |"' "$summary"
+                              } > "$(Agent.TempDirectory)/summary-${{ env.name }}.md"
+                              echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/summary-${{ env.name }}.md"
+
+                        - ${{ if ne(parameters.runJobKey, '') }}:
+                            - task: AzureCLI@2
+                              displayName: databricks bundle run ${{ parameters.runJobKey }}
+                              inputs:
+                                azureSubscription: ${{ env.serviceConnection }}
+                                scriptType: bash
+                                scriptLocation: inlineScript
+                                workingDirectory: $(bundleDir)
+                                addSpnToEnvironment: true
+                                inlineScript: |
+                                  set -euo pipefail
+                                  databricks bundle run -t ${{ env.name }} ${{ parameters.runJobKey }}

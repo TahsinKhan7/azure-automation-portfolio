@@ -1,0 +1,123 @@
+# =============================================================================
+# dataplatform-powershell : static analysis and tests for powershell/
+# -----------------------------------------------------------------------------
+#   PSScriptAnalyzer  settings from powershell/PSScriptAnalyzerSettings.psd1;
+#                     Error severity fails the build, Warnings are reported
+#   Pester 5          powershell/tests, NUnit results + JaCoCo coverage published
+# =============================================================================
+name: ps-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - powershell/**
+      - azure-devops-pipelines/powershell-quality.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - powershell/**
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: pesterMinimumVersion
+    type: string
+    default: '5.5.0'
+
+variables:
+  - name: resultsDir
+    value: $(Build.SourcesDirectory)/test-results
+
+stages:
+  - stage: Quality
+    displayName: Analyse and test
+    jobs:
+      - job: Quality
+        displayName: PSScriptAnalyzer + Pester
+        timeoutInMinutes: 20
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+              Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+              Install-Module -Name Pester -MinimumVersion '${{ parameters.pesterMinimumVersion }}' `
+                -Force -SkipPublisherCheck -Scope CurrentUser
+              Get-Module -ListAvailable PSScriptAnalyzer, Pester | Select-Object Name, Version | Format-Table -AutoSize
+            displayName: Install PSScriptAnalyzer and Pester
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $settings = 'powershell/PSScriptAnalyzerSettings.psd1'
+              $params = @{ Path = 'powershell'; Recurse = $true; Severity = @('Error', 'Warning') }
+              if (Test-Path $settings) {
+                $params.Settings = $settings
+              } else {
+                Write-Host "##vso[task.logissue type=warning]${settings} not found; using default rules."
+              }
+
+              $results = @(Invoke-ScriptAnalyzer @params)
+              foreach ($r in $results) {
+                $type = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
+                $file = [System.IO.Path]::GetRelativePath((Get-Location).Path, $r.ScriptPath)
+                $location = "sourcepath=${file};linenumber=$($r.Line);columnnumber=$($r.Column)"
+                Write-Host "##vso[task.logissue type=${type};${location}][$($r.RuleName)] $($r.Message)"
+              }
+              $errors = @($results | Where-Object Severity -eq 'Error')
+              $warnings = @($results | Where-Object Severity -eq 'Warning')
+              Write-Host "PSScriptAnalyzer: $($errors.Count) error(s), $($warnings.Count) warning(s). Only errors fail the build."
+              if ($errors.Count -gt 0) { exit 1 }
+            displayName: PSScriptAnalyzer
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              if (-not (Test-Path 'powershell/tests')) {
+                Write-Host '##vso[task.logissue type=warning]powershell/tests not found; nothing to run.'
+                exit 0
+              }
+              New-Item -ItemType Directory -Path '$(resultsDir)' -Force | Out-Null
+
+              # Equivalent to `Invoke-Pester -Path powershell/tests -CI` with explicit output paths.
+              $config = New-PesterConfiguration
+              $config.Run.Path = 'powershell/tests'
+              $config.Run.Exit = $true
+              $config.Output.Verbosity = 'Detailed'
+              $config.TestResult.Enabled = $true
+              $config.TestResult.OutputFormat = 'NUnitXml'
+              $config.TestResult.OutputPath = '$(resultsDir)/pester.xml'
+              $config.CodeCoverage.Enabled = $true
+              $config.CodeCoverage.Path = @(
+                Get-ChildItem -Path powershell -Recurse -Include *.ps1, *.psm1 |
+                  Where-Object FullName -notmatch '[\\/]tests[\\/]' |
+                  Select-Object -ExpandProperty FullName
+              )
+              $config.CodeCoverage.OutputFormat = 'JaCoCo'
+              $config.CodeCoverage.OutputPath = '$(resultsDir)/pester-coverage.xml'
+              Invoke-Pester -Configuration $config
+            displayName: Pester tests
+
+          - task: PublishTestResults@2
+            displayName: Publish Pester results (NUnit)
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: NUnit
+              testResultsFiles: $(resultsDir)/pester.xml
+              testRunTitle: Pester
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish Pester coverage (JaCoCo)
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: $(resultsDir)/pester-coverage.xml

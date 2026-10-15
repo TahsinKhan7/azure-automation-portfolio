@@ -1,0 +1,82 @@
+# release-drafter configuration: builds a draft GitHub release from merged PRs,
+# categorised by Conventional Commit prefix (via autolabeler) or label.
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+prerelease: false
+
+categories:
+  - title: "Breaking changes"
+    labels: ["breaking"]
+  - title: "Features"
+    labels: ["feature", "enhancement"]
+  - title: "Bug fixes"
+    labels: ["fix", "bug"]
+  - title: "Infrastructure"
+    labels: ["terraform", "bicep", "arm", "kubernetes"]
+  - title: "Pipelines and CI"
+    labels: ["ci", "pipeline"]
+  - title: "Documentation"
+    labels: ["docs", "documentation"]
+  - title: "Maintenance"
+    labels: ["chore", "refactor", "build", "test"]
+  - title: "Dependencies"
+    labels: ["dependencies"]
+    collapse-after: 5
+
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+change-title-escapes: '\<*_&'
+no-changes-template: "- No user-facing changes in this release."
+
+exclude-labels: ["skip-changelog"]
+
+version-resolver:
+  major:
+    labels: ["breaking"]
+  minor:
+    labels: ["feature", "enhancement"]
+  patch:
+    labels: ["fix", "bug", "chore", "docs", "ci", "build", "dependencies", "refactor", "test"]
+  default: patch
+
+# Conventional Commit prefixes in the PR title drive labels, and labels drive categories.
+autolabeler:
+  - label: "breaking"
+    title: ['/^[a-z]+(\(.+\))?!:/']
+    body: ["/BREAKING CHANGE/"]
+  - label: "feature"
+    title: ['/^feat(\(.+\))?:/']
+  - label: "fix"
+    title: ['/^fix(\(.+\))?:/']
+  - label: "docs"
+    title: ['/^docs(\(.+\))?:/']
+    files: ["**/*.md"]
+  - label: "ci"
+    title: ['/^ci(\(.+\))?:/']
+    files: [".github/**", "azure-devops-pipelines/**", "scripts/ci/**"]
+  - label: "chore"
+    title: ['/^chore(\(.+\))?:/']
+  - label: "refactor"
+    title: ['/^refactor(\(.+\))?:/']
+  - label: "build"
+    title: ['/^build(\(.+\))?:/']
+  - label: "test"
+    title: ['/^test(\(.+\))?:/']
+  - label: "terraform"
+    files: ["terraform/**"]
+  - label: "bicep"
+    files: ["arm-bicep/**"]
+  - label: "arm"
+    files: ["arm-templates/**"]
+  - label: "kubernetes"
+    files: ["kubernetes/**"]
+  - label: "python"
+    files: ["python/**", "databricks-bundles/**"]
+  - label: "powershell"
+    files: ["powershell/**"]
+
+template: |
+  ## What's changed
+
+  $CHANGES
+
+  **Full changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION

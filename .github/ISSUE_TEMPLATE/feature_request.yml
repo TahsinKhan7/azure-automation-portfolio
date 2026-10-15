@@ -1,0 +1,60 @@
+name: Feature request
+description: Suggest a new module, script, pipeline or improvement.
+title: "feat: <short description>"
+labels: ["enhancement", "triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - python (PySpark / data quality / Databricks utilities)
+        - terraform
+        - arm-bicep
+        - arm-templates
+        - powershell
+        - kubernetes
+        - sql
+        - kql-queries
+        - azure-devops-pipelines
+        - github workflows
+        - docs
+        - new area
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What operational or engineering problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the change. Include an example invocation, resource shape or pipeline stage if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: environments
+    attributes:
+      label: Environments this should roll out to
+      multiple: true
+      options:
+        - dev
+        - ite
+        - iqe
+        - preprod
+        - prod
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This change needs new secrets, variable groups or service connections (document them in the PR).
+        - label: This change affects production and needs an approval gate.

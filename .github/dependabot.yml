@@ -1,0 +1,55 @@
+# Dependabot keeps actions, Python dependencies and Terraform providers/modules current.
+# PR titles follow Conventional Commits so release-drafter categorises them automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/London
+    commit-message:
+      prefix: "ci"
+      include: scope
+    labels: ["dependencies", "ci"]
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/London
+    commit-message:
+      prefix: "build"
+      include: scope
+    labels: ["dependencies", "python"]
+    groups:
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # PySpark is pinned to the Databricks Runtime line in use; bump it deliberately.
+      - dependency-name: pyspark
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: terraform
+    directories:
+      - "/terraform/environments/*"
+      - "/terraform/modules/*"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "07:00"
+      timezone: Europe/London
+    commit-message:
+      prefix: "build"
+      include: scope
+    labels: ["dependencies", "terraform"]
+    groups:
+      terraform-providers:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
