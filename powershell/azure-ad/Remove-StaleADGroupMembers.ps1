@@ -1,67 +1,76 @@
 <#
 .SYNOPSIS
-    Removes stale users from Azure AD groups based on HR export or disable date.
-.DESCRIPTION
-    Compares AD group membership against an authoritative user list (e.g. from HR)
-    and removes users no longer authorised. Logs all removals for audit trail.
-.EXAMPLE
-    .\Remove-StaleADGroupMembers.ps1 -GroupName "DBX-Prod-Users" -AuthorisedUsersCsv ".\active_users.csv"
-#>
+    Removes group members who are not on an authoritative (HR) user list.
 
-[CmdletBinding()]
+.DESCRIPTION
+    Stale-member detection is in Get-DpStaleGroupMember and is unit tested.
+    This wrapper fetches membership, writes an audit CSV and removes members
+    only when -Apply is given.
+
+.EXAMPLE
+    ./Remove-StaleADGroupMembers.ps1 -GroupName 'dp-databricks-prod-users' -AuthorisedUsersCsv ./active_users.csv -Apply
+#>
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $true)][string]$GroupName,
-    [Parameter(Mandatory = $true)][string]$AuthorisedUsersCsv,
+    [Parameter(Mandatory)]
+    [string]$GroupName,
+
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+    [string]$AuthorisedUsersCsv,
+
+    [string]$AuditLogPath = './logs',
+
     [switch]$Apply
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== Stale Group Member Cleanup ===" -ForegroundColor Cyan
-Write-Host "Group: $GroupName"
+Write-DpLog -Message "Stale member clean-up for group '$GroupName'"
 
 $group = Get-AzADGroup -DisplayName $GroupName
-if (-not $group) { Write-Error "Group not found: $GroupName"; exit 1 }
+if (-not $group) {
+    throw "Group not found: $GroupName"
+}
 
-$authorised = (Import-Csv $AuthorisedUsersCsv).UserPrincipalName | ForEach-Object { $_.ToLower() }
-$currentMembers = Get-AzADGroupMember -GroupObjectId $group.Id
+$authorised = @((Import-Csv -Path $AuthorisedUsersCsv).UserPrincipalName)
+$members = @(Get-AzADGroupMember -GroupObjectId $group.Id)
+$stale = Get-DpStaleGroupMember -CurrentMember $members -AuthorisedUserPrincipalName $authorised
 
-$removeCount = 0
-$keepCount = 0
-$auditLog = @()
+Write-DpLog -Message "Members: $($members.Count) | Authorised list: $($authorised.Count) | Stale: $($stale.Count)"
 
-foreach ($member in $currentMembers) {
-    $upn = $member.UserPrincipalName.ToLower()
-    
-    if ($authorised -contains $upn) {
-        $keepCount++
-        continue
-    }
-
-    if ($Apply) {
+$audit = foreach ($member in $stale) {
+    $removed = $false
+    if ($Apply -and $PSCmdlet.ShouldProcess($member.UserPrincipalName, "Remove from $GroupName")) {
         Remove-AzADGroupMember -GroupObjectId $group.Id -MemberObjectId $member.Id
-        Write-Host "  Removed: $upn" -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "  Would remove: $upn" -ForegroundColor DarkGray
+        $removed = $true
+        Write-DpLog -Message "  Removed: $($member.UserPrincipalName)" -Level Warning
+    } else {
+        Write-DpLog -Message "  Would remove: $($member.UserPrincipalName)"
     }
 
-    $auditLog += [PSCustomObject]@{
-        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Group     = $GroupName
-        User      = $upn
-        Action    = if ($Apply) { "Removed" } else { "Pending" }
+    [pscustomobject]@{
+        Timestamp         = (Get-Date).ToString('s')
+        Group             = $GroupName
+        UserPrincipalName = $member.UserPrincipalName
+        Action            = if ($removed) { 'Removed' } else { 'Pending' }
     }
-    $removeCount++
 }
 
-# Export audit log
-if ($auditLog.Count -gt 0) {
-    $logPath = ".\logs\ad-cleanup-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
-    $auditLog | Export-Csv -Path $logPath -NoTypeInformation
-    Write-Host "`nAudit log: $logPath" -ForegroundColor Green
+if ($audit) {
+    if (-not (Test-Path -Path $AuditLogPath)) {
+        New-Item -ItemType Directory -Path $AuditLogPath -Force | Out-Null
+    }
+    $logFile = Join-Path -Path $AuditLogPath -ChildPath "ad-cleanup-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $audit | Export-Csv -Path $logFile -NoTypeInformation
+    Write-DpLog -Message "Audit log: $logFile" -Level Success
 }
 
-Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "Kept:    $keepCount"
-Write-Host "Removed: $removeCount"
+[pscustomobject]@{
+    Group   = $GroupName
+    Kept    = $members.Count - $stale.Count
+    Stale   = $stale.Count
+    Applied = [bool]$Apply
+}

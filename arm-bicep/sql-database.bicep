@@ -109,13 +109,13 @@ resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' 
   properties: {
     workspaceId: logAnalyticsWorkspaceId
     logs: [
-      { category: 'SQLInsights'; enabled: true }
-      { category: 'QueryStoreRuntimeStatistics'; enabled: true }
-      { category: 'Errors'; enabled: true }
-      { category: 'Timeouts'; enabled: true }
+      { category: 'SQLInsights', enabled: true }
+      { category: 'QueryStoreRuntimeStatistics', enabled: true }
+      { category: 'Errors', enabled: true }
+      { category: 'Timeouts', enabled: true }
     ]
     metrics: [
-      { category: 'Basic'; enabled: true }
+      { category: 'Basic', enabled: true }
     ]
   }
 }

@@ -21,11 +21,32 @@ param logAnalyticsWorkspaceId string = ''
 param allowedIpRanges array = []
 param tags object = {}
 
+// Access policy for the deploying principal plus read-only policies for each reader.
+var adminAccessPolicy = {
+  tenantId: subscription().tenantId
+  objectId: adminObjectId
+  permissions: {
+    secrets: ['Get', 'List', 'Set', 'Delete', 'Recover', 'Backup', 'Restore']
+    keys: ['Get', 'List', 'Create', 'Delete', 'Update', 'Recover']
+    certificates: ['Get', 'List', 'Create', 'Delete', 'Update']
+  }
+}
+
+var readerAccessPolicies = [for objectId in secretReaderObjectIds: {
+  tenantId: subscription().tenantId
+  objectId: objectId
+  permissions: {
+    secrets: ['Get', 'List']
+    keys: []
+    certificates: []
+  }
+}]
+
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: keyVaultName
   location: location
   properties: {
-    sku: { family: 'A'; name: 'standard' }
+    sku: { family: 'A', name: 'standard' }
     tenantId: subscription().tenantId
     enableSoftDelete: true
     softDeleteRetentionInDays: 90
@@ -36,28 +57,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
       bypass: 'AzureServices'
       ipRules: [for ip in allowedIpRanges: { value: ip }]
     }
-    accessPolicies: concat(
-      [
-        {
-          tenantId: subscription().tenantId
-          objectId: adminObjectId
-          permissions: {
-            secrets: ['Get', 'List', 'Set', 'Delete', 'Recover', 'Backup', 'Restore']
-            keys: ['Get', 'List', 'Create', 'Delete', 'Update', 'Recover']
-            certificates: ['Get', 'List', 'Create', 'Delete', 'Update']
-          }
-        }
-      ],
-      [for objectId in secretReaderObjectIds: {
-        tenantId: subscription().tenantId
-        objectId: objectId
-        permissions: {
-          secrets: ['Get', 'List']
-          keys: []
-          certificates: []
-        }
-      }]
-    )
+    accessPolicies: concat([adminAccessPolicy], readerAccessPolicies)
   }
   tags: union(tags, { ManagedBy: 'Bicep' })
 }
@@ -68,10 +68,10 @@ resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' 
   properties: {
     workspaceId: logAnalyticsWorkspaceId
     logs: [
-      { category: 'AuditEvent'; enabled: true; retentionPolicy: { enabled: true; days: 365 } }
+      { category: 'AuditEvent', enabled: true, retentionPolicy: { enabled: true, days: 365 } }
     ]
     metrics: [
-      { category: 'AllMetrics'; enabled: true }
+      { category: 'AllMetrics', enabled: true }
     ]
   }
 }

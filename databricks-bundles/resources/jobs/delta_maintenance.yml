@@ -1,0 +1,53 @@
+# Weekly OPTIMIZE / ZORDER / VACUUM over the allow-listed silver and gold tables.
+resources:
+  jobs:
+    delta_maintenance:
+      name: dataplatform-${var.environment}-delta-maintenance
+      description: Weekly Delta Lake file compaction and vacuum (allow-listed tables only).
+      tags:
+        platform: dataplatform
+        environment: ${var.environment}
+        cost_centre: data-engineering
+      max_concurrent_runs: 1
+      timeout_seconds: 14400
+
+      schedule:
+        quartz_cron_expression: "0 0 4 ? * SUN"
+        timezone_id: Europe/London
+        pause_status: ${var.schedule_pause_status}
+
+      email_notifications:
+        on_failure: [ "${var.alert_email}" ]
+
+      job_clusters:
+        - job_cluster_key: maintenance_cluster
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            policy_id: ${var.cluster_policy_id}
+            runtime_engine: PHOTON
+            data_security_mode: SINGLE_USER
+            num_workers: 2
+            azure_attributes:
+              availability: ${var.availability}
+              first_on_demand: 1
+            spark_env_vars:
+              DATAPLATFORM_ENV: ${var.environment}
+              DATAPLATFORM_CONFIG_DIR: ${var.config_dir}
+            custom_tags:
+              platform: dataplatform
+              environment: ${var.environment}
+              workload: maintenance
+
+      tasks:
+        - task_key: optimize_and_vacuum
+          job_cluster_key: maintenance_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/06_delta_maintenance.py
+            base_parameters:
+              env: ${var.environment}
+              dry_run: "false"
+          max_retries: 1
+          min_retry_interval_millis: 300000

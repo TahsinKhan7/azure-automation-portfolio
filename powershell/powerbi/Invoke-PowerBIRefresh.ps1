@@ -1,69 +1,72 @@
 <#
 .SYNOPSIS
-    Manages Power BI Gateway data sources and triggers dataset refreshes.
-.DESCRIPTION
-    Lists gateways, audits data source configurations, and triggers scheduled
-    or on-demand dataset refreshes across workspaces.
-.EXAMPLE
-    .\Invoke-PowerBIRefresh.ps1 -WorkspaceName "Finance Reports" -DatasetName "Monthly Revenue"
-#>
+    Lists gateways or triggers Power BI dataset refreshes.
 
-[CmdletBinding()]
+.EXAMPLE
+    ./Invoke-PowerBIRefresh.ps1 -WorkspaceName 'Finance Reports' -DatasetName 'Monthly Revenue'
+.EXAMPLE
+    ./Invoke-PowerBIRefresh.ps1 -WorkspaceName 'Finance Reports' -RefreshAll
+#>
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $false)][string]$WorkspaceName,
-    [Parameter(Mandatory = $false)][string]$DatasetName,
+    [string]$WorkspaceName,
+
+    [string]$DatasetName,
+
     [switch]$ListGateways,
+
     [switch]$RefreshAll
 )
 
-$ErrorActionPreference = "Stop"
-$baseUrl = "https://api.powerbi.com/v1.0/myorg"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-# Get access token
+$baseUrl = 'https://api.powerbi.com/v1.0/myorg'
 Connect-PowerBIServiceAccount | Out-Null
-$token = (Get-PowerBIAccessToken -AsString).Replace("Bearer ", "")
-$headers = @{ "Authorization" = "Bearer $token"; "Content-Type" = "application/json" }
+$headers = @{ 'Content-Type' = 'application/json' }
+$headers['Authorization'] = Get-PowerBIAccessToken -AsString
 
-Write-Host "`n=== Power BI Gateway & Refresh Manager ===" -ForegroundColor Cyan
+Write-DpLog -Message 'Power BI gateway and refresh manager'
 
 if ($ListGateways) {
-    $response = Invoke-RestMethod -Uri "$baseUrl/gateways" -Headers $headers -Method GET
-    Write-Host "`nGateways:" -ForegroundColor Cyan
-    foreach ($gw in $response.value) {
-        Write-Host "  $($gw.name) | Type: $($gw.type) | ID: $($gw.id)"
-        
-        # List data sources for each gateway
-        $ds = Invoke-RestMethod -Uri "$baseUrl/gateways/$($gw.id)/datasources" -Headers $headers -Method GET
-        foreach ($source in $ds.value) {
-            Write-Host "    Source: $($source.datasourceName) | Type: $($source.datasourceType) | Status: $($source.connectionDetails)" -ForegroundColor DarkGray
+    $gateways = (Invoke-RestMethod -Uri "$baseUrl/gateways" -Headers $headers -Method GET).value
+    foreach ($gateway in $gateways) {
+        $sources = (Invoke-RestMethod -Uri "$baseUrl/gateways/$($gateway.id)/datasources" -Headers $headers -Method GET).value
+        [pscustomobject]@{
+            Gateway     = $gateway.name
+            Type        = $gateway.type
+            Id          = $gateway.id
+            DataSources = ($sources | ForEach-Object { "$($_.datasourceName) ($($_.datasourceType))" }) -join '; '
         }
     }
     return
 }
 
-if ($WorkspaceName -and $DatasetName) {
-    $ws = Get-PowerBIWorkspace -Name $WorkspaceName
-    $dataset = Get-PowerBIDataset -WorkspaceId $ws.Id | Where-Object { $_.Name -eq $DatasetName }
-
-    if (-not $dataset) { Write-Error "Dataset '$DatasetName' not found."; exit 1 }
-
-    Write-Host "Triggering refresh: $DatasetName in $WorkspaceName"
-    Invoke-RestMethod -Uri "$baseUrl/groups/$($ws.Id)/datasets/$($dataset.Id)/refreshes" `
-                      -Headers $headers -Method POST -Body "{}"
-    Write-Host "  Refresh triggered." -ForegroundColor Green
+if (-not $WorkspaceName) {
+    throw 'WorkspaceName is required unless -ListGateways is used.'
 }
 
-if ($RefreshAll -and $WorkspaceName) {
-    $ws = Get-PowerBIWorkspace -Name $WorkspaceName
-    $datasets = Get-PowerBIDataset -WorkspaceId $ws.Id | Where-Object { $_.IsRefreshable }
+$workspace = Get-PowerBIWorkspace -Name $WorkspaceName
+$datasets = @(Get-PowerBIDataset -WorkspaceId $workspace.Id)
 
-    foreach ($ds in $datasets) {
-        Write-Host "  Refreshing: $($ds.Name)..." -ForegroundColor Yellow
+$targets = if ($RefreshAll) {
+    $datasets | Where-Object { $_.IsRefreshable }
+} else {
+    $match = $datasets | Where-Object { $_.Name -eq $DatasetName }
+    if (-not $match) { throw "Dataset '$DatasetName' not found in workspace '$WorkspaceName'." }
+    $match
+}
+
+foreach ($dataset in $targets) {
+    if ($PSCmdlet.ShouldProcess("$WorkspaceName/$($dataset.Name)", 'Trigger refresh')) {
         try {
-            Invoke-RestMethod -Uri "$baseUrl/groups/$($ws.Id)/datasets/$($ds.Id)/refreshes" `
-                              -Headers $headers -Method POST -Body "{}"
-            Write-Host "    Triggered." -ForegroundColor Green
+            Invoke-RestMethod -Uri "$baseUrl/groups/$($workspace.Id)/datasets/$($dataset.Id)/refreshes" -Headers $headers -Method POST -Body '{}' | Out-Null
+            Write-DpLog -Message "Refresh triggered: $($dataset.Name)" -Level Success
+            [pscustomobject]@{ Workspace = $WorkspaceName; Dataset = $dataset.Name; Status = 'Triggered' }
+        } catch {
+            Write-DpLog -Message "Refresh failed for $($dataset.Name): $($_.Exception.Message)" -Level Warning
+            [pscustomobject]@{ Workspace = $WorkspaceName; Dataset = $dataset.Name; Status = 'Failed' }
         }
-        catch { Write-Warning "    Failed: $_" }
     }
 }

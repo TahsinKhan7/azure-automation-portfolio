@@ -1,0 +1,57 @@
+# Dataset definitions shared across all environments.
+# Each dataset describes how it is ingested (landing -> bronze), conformed (bronze -> silver)
+# and aggregated (silver -> gold). The CLI and notebooks look datasets up here by name.
+claims:
+  source_format: csv
+  source_options:
+    header: "true"
+    delimiter: ","
+    dateFormat: yyyy-MM-dd
+  schema_ddl: >-
+    claim_id STRING, policy_number STRING, claim_date DATE, claim_type STRING,
+    claim_amount DECIMAL(18,2), business_unit STRING, status STRING, claimant_name STRING
+  key_columns: [claim_id]
+  order_column: _ingested_at
+  date_column: claim_date
+  value_column: claim_amount
+  group_columns: [business_unit, claim_type]
+  partition_columns: [year, month]
+  cast_schema:
+    claim_amount: decimal(18,2)
+    claim_date: date
+  quality_suite: quality/claims_silver.yml
+
+policies:
+  source_format: json
+  source_options:
+    multiLine: "false"
+  schema_ddl: >-
+    policy_number STRING, customer_id STRING, product STRING, start_date DATE, end_date DATE,
+    annual_premium DECIMAL(18,2), status STRING
+  key_columns: [policy_number]
+  order_column: _ingested_at
+  date_column: start_date
+  value_column: annual_premium
+  group_columns: [product]
+  partition_columns: [year]
+  cast_schema:
+    annual_premium: decimal(18,2)
+  quality_suite: quality/policies_silver.yml
+
+customers:
+  source_format: parquet
+  source_options: {}
+  schema_ddl: >-
+    customer_id STRING, full_name STRING, email STRING, postcode STRING, segment STRING,
+    updated_at TIMESTAMP
+  key_columns: [customer_id]
+  order_column: updated_at
+  date_column: updated_at
+  value_column: null
+  group_columns: [segment]
+  partition_columns: []
+  cast_schema: {}
+  quality_suite: quality/customers_silver.yml
+  scd2:
+    tracked_columns: [full_name, email, postcode, segment]
+    effective_from_column: updated_at

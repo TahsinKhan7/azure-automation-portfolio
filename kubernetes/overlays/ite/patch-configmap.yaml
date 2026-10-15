@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-api-config
+data:
+  ENVIRONMENT: ite
+  LOG_LEVEL: INFO
+  KEY_VAULT_NAME: kv-dp-data-ite-01
+  STORAGE_ACCOUNT: stdpdataite01
+  UNITY_CATALOG: dp_data_ite
+  DATABRICKS_HOST: https://adb-0000000000000000.0.azuredatabricks.net

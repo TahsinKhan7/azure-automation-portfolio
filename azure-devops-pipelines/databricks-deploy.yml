@@ -1,118 +1,126 @@
-# Databricks Deployment Pipeline
-# Deploys notebooks, jobs and libraries to Databricks workspaces
-# Supports dev/prod workspace promotion via Databricks CLI and REST API
+# =============================================================================
+# dataplatform-databricks-redeploy : targeted redeploy / rollback (manual only)
+# -----------------------------------------------------------------------------
+# cd-pipeline.yml is the normal promotion path. This pipeline is for operations:
+# push a *specific* dataplatform-ci build (chosen in the "Resources" picker when
+# queuing the run) to a *single* environment, for example to roll production
+# back to the previous wheel. It reuses the same Environment approvals.
+# =============================================================================
+name: dbx-redeploy-$(Date:yyyyMMdd)$(Rev:.r)
 
-trigger:
-  branches:
-    include:
-      - main
-  paths:
-    include:
-      - databricks/**
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci
+      source: dataplatform-ci
+      # No trigger: the run (and therefore the wheel version) is chosen manually.
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 parameters:
   - name: environment
-    displayName: 'Target Environment'
+    displayName: Target environment
     type: string
-    default: 'dev'
-    values:
-      - dev
-      - prod
+    default: dev
+    values: [dev, ite, iqe, preprod, prod]
+  - name: reason
+    displayName: Reason (recorded in the run summary, e.g. "rollback INC-1234")
+    type: string
+    default: not specified
+  - name: importNotebooks
+    displayName: Also re-import notebooks from the chosen build
+    type: boolean
+    default: true
 
 variables:
-  - name: workspaceUrl
-    ${{ if eq(parameters.environment, 'prod') }}:
-      value: 'https://adb-prod.azuredatabricks.net'
-    ${{ else }}:
-      value: 'https://adb-dev.azuredatabricks.net'
-  - group: 'databricks-${{ parameters.environment }}'
+  - group: dataplatform-${{ parameters.environment }}
+  - name: artifactName
+    value: dataplatform-python
+  - name: artifactRoot
+    value: $(Pipeline.Workspace)/ci/$(artifactName)
+  - name: serviceConnection
+    value: sc-dataplatform-${{ parameters.environment }}
 
 stages:
-
-  - stage: ValidateNotebooks
-    displayName: 'Validate Notebooks'
+  - stage: Redeploy
+    displayName: Redeploy to ${{ parameters.environment }}
     jobs:
-      - job: Validate
-        steps:
-          - task: UsePythonVersion@0
-            inputs:
-              versionSpec: '3.10'
-
-          - script: |
-              pip install databricks-cli pyspark flake8
-            displayName: 'Install tools'
-
-          - script: |
-              echo "Linting PySpark notebooks..."
-              find databricks/notebooks -name "*.py" -exec flake8 {} --max-line-length=120 \;
-            displayName: 'Lint notebooks'
-
-          - script: |
-              echo "Validating job definitions..."
-              for f in databricks/jobs/*.json; do
-                python -c "import json; json.load(open('$f'))" && echo "  Valid: $f" || exit 1
-              done
-            displayName: 'Validate job JSON configs'
-
-  - stage: Deploy
-    displayName: 'Deploy to ${{ parameters.environment }}'
-    dependsOn: ValidateNotebooks
-    jobs:
-      - deployment: DeployDatabricks
-        environment: '${{ parameters.environment }}'
+      - deployment: Redeploy
+        displayName: Databricks ${{ parameters.environment }}
+        environment: dataplatform-${{ parameters.environment }}
+        timeoutInMinutes: 30
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
+                  fetchDepth: 1
 
-                # Upload notebooks to workspace
+                - download: ci
+                  artifact: $(artifactName)
+                  displayName: Download chosen build
+
+                - bash: |
+                    set -euo pipefail
+                    echo "Selected build: $(resources.pipeline.ci.runName)"
+                    echo "  run id: $(resources.pipeline.ci.runID)  commit: $(resources.pipeline.ci.sourceCommit)"
+                    cat "$(artifactRoot)/build-info.json"
+                    wheel=$(find "$(artifactRoot)/wheel" -name '*.whl' | head -n 1)
+                    [ -n "$wheel" ] || { echo "##vso[task.logissue type=error]No wheel in artefact"; exit 1; }
+                    echo "##vso[task.setvariable variable=wheelPath]${wheel}"
+                    echo "##vso[task.setvariable variable=wheelName]$(basename "$wheel")"
+                  displayName: Inspect artefact
+
+                - bash: scripts/ci/install-databricks-cli.sh
+                  displayName: Install Databricks CLI (pinned, checksum verified)
+
                 - task: AzureCLI@2
+                  displayName: Upload wheel
                   inputs:
-                    azureSubscription: '$(azureServiceConnection)'
-                    scriptType: 'bash'
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
                     inlineScript: |
-                      TOKEN=$(az account get-access-token \
-                        --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d \
-                        --query accessToken -o tsv)
+                      set -euo pipefail
+                      export DATABRICKS_HOST="$(databricksHost)"
+                      export DATABRICKS_AUTH_TYPE=azure-cli
+                      folder="$(wheelVolumePath)/$(resources.pipeline.ci.runName)"
+                      databricks fs mkdir "dbfs:${folder}"
+                      databricks fs cp --overwrite "$(wheelPath)" "dbfs:${folder}/$(wheelName)"
+                      databricks fs ls "dbfs:${folder}"
+                      echo "##vso[task.setvariable variable=deployedWheel]${folder}/$(wheelName)"
 
-                      echo "Uploading notebooks to $(workspaceUrl)..."
-                      for nb in databricks/notebooks/*.py; do
-                        FILENAME=$(basename "$nb" .py)
-                        CONTENT=$(base64 -w 0 "$nb")
-                        
-                        curl -s -X POST "$(workspaceUrl)/api/2.0/workspace/import" \
-                          -H "Authorization: Bearer $TOKEN" \
-                          -H "Content-Type: application/json" \
-                          -d "{
-                            \"path\": \"/Shared/deployed/$FILENAME\",
-                            \"format\": \"SOURCE\",
-                            \"language\": \"PYTHON\",
-                            \"content\": \"$CONTENT\",
-                            \"overwrite\": true
-                          }"
-                        echo "  Deployed: $FILENAME"
-                      done
-                  displayName: 'Deploy notebooks'
+                - ${{ if eq(parameters.importNotebooks, true) }}:
+                    - task: AzureCLI@2
+                      displayName: Re-import notebooks
+                      condition: and(succeeded(), ne(variables['notebookWorkspaceRoot'], ''))
+                      inputs:
+                        azureSubscription: $(serviceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        addSpnToEnvironment: true
+                        inlineScript: |
+                          set -euo pipefail
+                          export DATABRICKS_HOST="$(databricksHost)"
+                          export DATABRICKS_AUTH_TYPE=azure-cli
+                          src="$(artifactRoot)/notebooks"
+                          [ -d "$src" ] || { echo "No notebooks in artefact; skipping."; exit 0; }
+                          databricks workspace mkdirs "$(notebookWorkspaceRoot)"
+                          databricks workspace import-dir --overwrite "$src" "$(notebookWorkspaceRoot)"
 
-                # Create/update jobs
-                - task: AzureCLI@2
-                  inputs:
-                    azureSubscription: '$(azureServiceConnection)'
-                    scriptType: 'bash'
-                    inlineScript: |
-                      TOKEN=$(az account get-access-token \
-                        --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d \
-                        --query accessToken -o tsv)
-
-                      for job_file in databricks/jobs/*.json; do
-                        echo "Deploying job: $job_file"
-                        curl -s -X POST "$(workspaceUrl)/api/2.1/jobs/create" \
-                          -H "Authorization: Bearer $TOKEN" \
-                          -H "Content-Type: application/json" \
-                          -d @"$job_file"
-                      done
-                  displayName: 'Deploy jobs'
+                - bash: |
+                    set -euo pipefail
+                    {
+                      echo "## Redeploy to ${{ parameters.environment }}"
+                      echo
+                      echo "- Reason: ${{ parameters.reason }}"
+                      echo "- Build: $(resources.pipeline.ci.runName) (commit $(resources.pipeline.ci.sourceCommit))"
+                      echo "- Wheel: \`$(deployedWheel)\`"
+                      echo "- Requested by: $(Build.RequestedFor)"
+                    } > "$(Agent.TempDirectory)/redeploy-summary.md"
+                    echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/redeploy-summary.md"
+                  displayName: Record summary

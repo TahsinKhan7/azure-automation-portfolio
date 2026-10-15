@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-api
+spec:
+  # selector is repeated only to satisfy strict schema validation of the
+  # patch file on its own; kustomize merges it unchanged.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-api
+  template:
+    spec:
+      containers:
+        - name: data-api
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi

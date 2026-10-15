@@ -1,0 +1,183 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Log Analytics workspace that receives diagnostics from every platform resource, with retention, daily cap and a set of saved searches used by the operations team.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "workspaceName": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Name of the Log Analytics workspace."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the workspace."
+      }
+    },
+    "sku": {
+      "type": "string",
+      "defaultValue": "PerGB2018",
+      "allowedValues": [
+        "PerGB2018",
+        "CapacityReservation"
+      ],
+      "metadata": {
+        "description": "Pricing tier. CapacityReservation only makes sense for high-volume production workspaces."
+      }
+    },
+    "capacityReservationLevel": {
+      "type": "int",
+      "defaultValue": 100,
+      "allowedValues": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        1000,
+        2000,
+        5000
+      ],
+      "metadata": {
+        "description": "Daily GB commitment when sku is CapacityReservation. Ignored otherwise."
+      }
+    },
+    "retentionInDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 30,
+      "maxValue": 730,
+      "metadata": {
+        "description": "Interactive retention in days. Non-production environments use the minimum; production is typically 90 or more."
+      }
+    },
+    "dailyQuotaGb": {
+      "type": "int",
+      "defaultValue": -1,
+      "minValue": -1,
+      "maxValue": 5000,
+      "metadata": {
+        "description": "Daily ingestion cap in GB. Use -1 for no cap. A cap protects non-production budgets from runaway logging."
+      }
+    },
+    "publicNetworkAccessForIngestion": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Whether resources may send data over the public endpoint. Disabled requires an Azure Monitor Private Link Scope."
+      }
+    },
+    "publicNetworkAccessForQuery": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Whether the workspace can be queried over the public endpoint."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to the workspace."
+      }
+    }
+  },
+  "variables": {
+    "workspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]",
+    "skuObject": "[if(equals(parameters('sku'), 'CapacityReservation'), createObject('name', parameters('sku'), 'capacityReservationLevel', parameters('capacityReservationLevel')), createObject('name', parameters('sku')))]",
+    "savedSearches": [
+      {
+        "name": "dp-adf-failed-pipeline-runs",
+        "category": "Data Platform",
+        "displayName": "ADF failed pipeline runs (24h)",
+        "query": "ADFPipelineRun | where TimeGenerated > ago(24h) | where Status == 'Failed' | project TimeGenerated, PipelineName, RunId, FailureType, Parameters | order by TimeGenerated desc"
+      },
+      {
+        "name": "dp-databricks-cluster-events",
+        "category": "Data Platform",
+        "displayName": "Databricks cluster terminations (24h)",
+        "query": "DatabricksClusters | where TimeGenerated > ago(24h) | where ActionName in ('terminate', 'deleteCluster') | project TimeGenerated, Identity, ActionName, RequestParams | order by TimeGenerated desc"
+      },
+      {
+        "name": "dp-keyvault-denied-access",
+        "category": "Data Platform",
+        "displayName": "Key Vault access denied (7d)",
+        "query": "AzureDiagnostics | where TimeGenerated > ago(7d) | where ResourceProvider == 'MICROSOFT.KEYVAULT' and ResultType != 'Success' | summarize count() by Resource, OperationName, CallerIPAddress, identity_claim_appid_g | order by count_ desc"
+      },
+      {
+        "name": "dp-storage-auth-failures",
+        "category": "Data Platform",
+        "displayName": "Storage authentication failures (24h)",
+        "query": "StorageBlobLogs | where TimeGenerated > ago(24h) | where StatusText has 'AuthenticationFailed' or StatusText has 'AuthorizationFailure' | summarize count() by AccountName, OperationName, CallerIpAddress | order by count_ desc"
+      }
+    ]
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2025-07-01",
+      "name": "[parameters('workspaceName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "sku": "[variables('skuObject')]",
+        "retentionInDays": "[parameters('retentionInDays')]",
+        "workspaceCapping": {
+          "dailyQuotaGb": "[parameters('dailyQuotaGb')]"
+        },
+        "publicNetworkAccessForIngestion": "[parameters('publicNetworkAccessForIngestion')]",
+        "publicNetworkAccessForQuery": "[parameters('publicNetworkAccessForQuery')]",
+        "features": {
+          "enableLogAccessUsingOnlyResourcePermissions": true,
+          "disableLocalAuth": false
+        }
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+      "apiVersion": "2025-07-01",
+      "name": "[format('{0}/{1}', parameters('workspaceName'), variables('savedSearches')[copyIndex()].name)]",
+      "dependsOn": [
+        "[variables('workspaceId')]"
+      ],
+      "copy": {
+        "name": "savedSearchLoop",
+        "count": "[length(variables('savedSearches'))]"
+      },
+      "properties": {
+        "category": "[variables('savedSearches')[copyIndex()].category]",
+        "displayName": "[variables('savedSearches')[copyIndex()].displayName]",
+        "query": "[variables('savedSearches')[copyIndex()].query]",
+        "version": 2
+      }
+    }
+  ],
+  "outputs": {
+    "workspaceResourceId": {
+      "type": "string",
+      "value": "[variables('workspaceId')]"
+    },
+    "workspaceName": {
+      "type": "string",
+      "value": "[parameters('workspaceName')]"
+    },
+    "workspaceCustomerId": {
+      "type": "string",
+      "value": "[reference(variables('workspaceId'), '2023-09-01').customerId]"
+    }
+  }
+}

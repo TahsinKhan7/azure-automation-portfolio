@@ -1,79 +1,83 @@
 <#
 .SYNOPSIS
-    Manages Azure RBAC role assignments across subscriptions and resource groups.
-.DESCRIPTION
-    Assigns, audits or removes RBAC roles based on a config file.
-    Supports subscription-level, resource group-level and resource-level assignments.
-.EXAMPLE
-    .\Set-AzureRBAC.ps1 -ConfigFile ".\config\rbac-assignments.json" -Apply
-#>
+    Applies, removes or audits Azure RBAC role assignments from a JSON definition.
 
-[CmdletBinding()]
+.DESCRIPTION
+    Each entry names a principal (group, user or service principal), a role and
+    a scope. -AuditOnly reports drift without changing anything; -Apply makes
+    the changes. Existing assignments are skipped.
+
+.EXAMPLE
+    ./Set-AzureRBAC.ps1 -ConfigFile ./config/rbac-assignments.json -AuditOnly
+#>
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $true)][string]$ConfigFile,
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+    [string]$ConfigFile,
+
     [switch]$Apply,
+
     [switch]$AuditOnly
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== RBAC Assignment Manager ===" -ForegroundColor Cyan
+Write-DpLog -Message 'RBAC assignment manager'
 
-$config = Get-Content $ConfigFile | ConvertFrom-Json
-$assigned = 0; $skipped = 0; $removed = 0
+$config = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
+$assigned = 0
+$removed = 0
+$skipped = 0
 
-foreach ($entry in $config.assignments) {
-    $principalId = $null
-    
-    # Resolve principal (user, group, or service principal)
-    switch ($entry.principalType) {
-        "Group" {
-            $grp = Get-AzADGroup -DisplayName $entry.principalName
-            $principalId = $grp.Id
-        }
-        "User" {
-            $usr = Get-AzADUser -UserPrincipalName $entry.principalName
-            $principalId = $usr.Id
-        }
-        "ServicePrincipal" {
-            $sp = Get-AzADServicePrincipal -DisplayName $entry.principalName
-            $principalId = $sp.Id
-        }
+$results = foreach ($entry in $config.assignments) {
+    $principal = switch ($entry.principalType) {
+        'Group' { Get-AzADGroup -DisplayName $entry.principalName -ErrorAction SilentlyContinue }
+        'User' { Get-AzADUser -UserPrincipalName $entry.principalName -ErrorAction SilentlyContinue }
+        'ServicePrincipal' { Get-AzADServicePrincipal -DisplayName $entry.principalName -ErrorAction SilentlyContinue }
+        default { $null }
     }
 
-    if (-not $principalId) {
-        Write-Warning "  Principal not found: $($entry.principalName)"
+    if (-not $principal) {
+        Write-DpLog -Message "  Principal not found: $($entry.principalName) ($($entry.principalType))" -Level Warning
         $skipped++
         continue
     }
 
+    $existing = Get-AzRoleAssignment -ObjectId $principal.Id -Scope $entry.scope -ErrorAction SilentlyContinue |
+        Where-Object { $_.RoleDefinitionName -eq $entry.roleName -and $_.Scope -eq $entry.scope }
+    $hasRole = [bool]$existing
+    $status = if ($hasRole) { 'Assigned' } else { 'Missing' }
+
     if ($AuditOnly) {
-        $existing = Get-AzRoleAssignment -ObjectId $principalId -Scope $entry.scope -ErrorAction SilentlyContinue
-        $hasRole = $existing | Where-Object { $_.RoleDefinitionName -eq $entry.roleName }
-        $status = if ($hasRole) { "ASSIGNED" } else { "MISSING" }
-        Write-Host "  [$status] $($entry.principalName) -> $($entry.roleName) @ $($entry.scope)" -ForegroundColor $(if ($hasRole) { "Green" } else { "Yellow" })
-        continue
+        Write-DpLog -Message "  [$status] $($entry.principalName) -> $($entry.roleName) @ $($entry.scope)"
+    } elseif ($entry.action -eq 'Remove') {
+        if ($hasRole -and $Apply -and $PSCmdlet.ShouldProcess($entry.scope, "Remove $($entry.roleName) from $($entry.principalName)")) {
+            Remove-AzRoleAssignment -ObjectId $principal.Id -RoleDefinitionName $entry.roleName -Scope $entry.scope
+            $removed++
+            $status = 'Removed'
+        }
+    } elseif (-not $hasRole) {
+        if ($Apply -and $PSCmdlet.ShouldProcess($entry.scope, "Assign $($entry.roleName) to $($entry.principalName)")) {
+            New-AzRoleAssignment -ObjectId $principal.Id -RoleDefinitionName $entry.roleName -Scope $entry.scope | Out-Null
+            $assigned++
+            $status = 'Assigned'
+        } else {
+            $status = 'WouldAssign'
+        }
+    } else {
+        $skipped++
     }
 
-    if ($entry.action -eq "Remove" -and $Apply) {
-        Remove-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName $entry.roleName -Scope $entry.scope
-        Write-Host "  Removed: $($entry.principalName) -> $($entry.roleName)" -ForegroundColor Yellow
-        $removed++
-    }
-    elseif ($Apply) {
-        try {
-            New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName $entry.roleName -Scope $entry.scope -ErrorAction Stop
-            Write-Host "  Assigned: $($entry.principalName) -> $($entry.roleName)" -ForegroundColor Green
-            $assigned++
-        }
-        catch {
-            if ($_.Exception.Message -like "*already exists*") {
-                Write-Host "  Exists: $($entry.principalName) -> $($entry.roleName)" -ForegroundColor DarkGray
-                $skipped++
-            }
-            else { throw }
-        }
+    [pscustomobject]@{
+        Principal = $entry.principalName
+        Role      = $entry.roleName
+        Scope     = $entry.scope
+        Status    = $status
     }
 }
 
-Write-Host "`nAssigned: $assigned | Removed: $removed | Skipped: $skipped"
+Write-DpLog -Message "Assigned: $assigned | Removed: $removed | Skipped: $skipped"
+$results

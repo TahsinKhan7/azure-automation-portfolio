@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: data-api
+spec:
+  # Allows node drains during AKS upgrades while keeping the API available.
+  # With a single replica (dev) the budget is unsatisfiable by design and the
+  # drain simply proceeds; the overlay for prod raises minAvailable.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-api

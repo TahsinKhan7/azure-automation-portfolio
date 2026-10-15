@@ -1,0 +1,145 @@
+# Nightly medallion pipeline: landing -> bronze -> silver -> DQ gate -> gold (+ SCD2 dimension).
+resources:
+  jobs:
+    medallion_pipeline:
+      name: dataplatform-${var.environment}-medallion-pipeline
+      description: >-
+        Ingest claims and customers, conform to silver, gate on data quality and build gold
+        KPIs and the customer SCD2 dimension.
+      tags:
+        platform: dataplatform
+        environment: ${var.environment}
+        cost_centre: data-engineering
+      max_concurrent_runs: 1
+      timeout_seconds: 10800
+
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: Europe/London
+        pause_status: ${var.schedule_pause_status}
+
+      email_notifications:
+        on_failure: [ "${var.alert_email}" ]
+        on_duration_warning_threshold_exceeded: [ "${var.alert_email}" ]
+        no_alert_for_skipped_runs: true
+      webhook_notifications:
+        on_failure:
+          - id: "00000000-0000-0000-0000-00000000beef"   # Teams / PagerDuty destination created in workspace settings
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 7200
+
+      parameters:
+        - name: env
+          default: ${var.environment}
+
+      job_clusters:
+        - job_cluster_key: medallion_cluster
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            policy_id: ${var.cluster_policy_id}
+            runtime_engine: PHOTON
+            data_security_mode: SINGLE_USER
+            autoscale:
+              min_workers: ${var.min_workers}
+              max_workers: ${var.max_workers}
+            azure_attributes:
+              availability: ${var.availability}
+              first_on_demand: 1
+              spot_bid_max_price: -1
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.autoCompact.enabled: "true"
+              spark.sql.shuffle.partitions: "auto"
+            spark_env_vars:
+              DATAPLATFORM_ENV: ${var.environment}
+              DATAPLATFORM_CONFIG_DIR: ${var.config_dir}
+            custom_tags:
+              platform: dataplatform
+              environment: ${var.environment}
+
+      tasks:
+        - task_key: landing_to_bronze_claims
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/01_landing_to_bronze.py
+            base_parameters: { env: "${var.environment}", dataset: claims, use_autoloader: "true" }
+          max_retries: 2
+          min_retry_interval_millis: 120000
+          retry_on_timeout: false
+
+        - task_key: landing_to_bronze_customers
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/01_landing_to_bronze.py
+            base_parameters: { env: "${var.environment}", dataset: customers, use_autoloader: "true" }
+          max_retries: 2
+          min_retry_interval_millis: 120000
+
+        - task_key: bronze_to_silver_claims
+          depends_on: [ { task_key: landing_to_bronze_claims } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/02_bronze_to_silver.py
+            base_parameters: { env: "${var.environment}", dataset: claims }
+          max_retries: 1
+
+        - task_key: bronze_to_silver_customers
+          depends_on: [ { task_key: landing_to_bronze_customers } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/02_bronze_to_silver.py
+            base_parameters: { env: "${var.environment}", dataset: customers }
+          max_retries: 1
+
+        - task_key: data_quality_gate_claims
+          depends_on: [ { task_key: bronze_to_silver_claims } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/04_data_quality_gate.py
+            base_parameters: { env: "${var.environment}", dataset: claims, layer: silver }
+          # No retries: a failed gate is a data problem, not a transient one.
+          max_retries: 0
+
+        - task_key: data_quality_gate_customers
+          depends_on: [ { task_key: bronze_to_silver_customers } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/04_data_quality_gate.py
+            base_parameters: { env: "${var.environment}", dataset: customers, layer: silver }
+          max_retries: 0
+
+        - task_key: silver_to_gold_claims
+          depends_on: [ { task_key: data_quality_gate_claims } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/03_silver_to_gold.py
+            base_parameters: { env: "${var.environment}", dataset: claims }
+          max_retries: 1
+
+        - task_key: scd2_customer_dimension
+          depends_on: [ { task_key: data_quality_gate_customers } ]
+          job_cluster_key: medallion_cluster
+          libraries:
+            - whl: ../../python/dist/*.whl
+          notebook_task:
+            notebook_path: ../../python/notebooks/05_scd2_customer_dimension.py
+            base_parameters: { env: "${var.environment}", dataset: customers }
+          max_retries: 1

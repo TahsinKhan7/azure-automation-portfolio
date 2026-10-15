@@ -1,0 +1,35 @@
+# Delta Live Tables variant of the claims flow, for teams that prefer declarative pipelines
+# with built-in expectations and lineage over notebook jobs.
+resources:
+  pipelines:
+    claims_dlt:
+      name: dataplatform-${var.environment}-claims-dlt
+      catalog: ${var.catalog}
+      target: dlt_claims
+      serverless: false
+      continuous: false
+      development: true
+      photon: true
+      channel: CURRENT
+      edition: ADVANCED            # required for expectations
+      libraries:
+        - notebook:
+            path: ../../src/dlt_claims_pipeline.py
+      configuration:
+        dataplatform.environment: ${var.environment}
+        dataplatform.landing_path: abfss://landing@${var.storage_account}.dfs.core.windows.net/claims/
+        pipelines.autoOptimize.zOrderCols: claim_date,policy_number
+      clusters:
+        - label: default
+          node_type_id: ${var.node_type_id}
+          policy_id: ${var.cluster_policy_id}
+          autoscale:
+            min_workers: ${var.min_workers}
+            max_workers: ${var.max_workers}
+            mode: ENHANCED
+          azure_attributes:
+            availability: ${var.availability}
+            first_on_demand: 1
+      notifications:
+        - email_recipients: [ "${var.alert_email}" ]
+          alerts: [ on-update-failure, on-flow-failure ]

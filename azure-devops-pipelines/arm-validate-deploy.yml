@@ -1,0 +1,208 @@
+# ARM template pipeline: quality gates, then promotion through dev -> ite -> iqe -> preprod -> prod.
+#
+# One template, five parameter files. The Quality stage runs ARM-TTK and static checks once and
+# packages arm-templates/ as an artefact; each environment stage republishes that exact package as
+# a Template Spec version in its own subscription, validates, runs what-if and deploys.
+#
+# Gates, in order of appearance:
+#   - Pull requests        : Quality stage + a validate-only what-if against dev (no deployment).
+#   - dev, ite             : automatic after validation and what-if succeed.
+#   - iqe                  : Azure DevOps Environment approval (platform lead).
+#   - preprod              : Environment approval + what-if must contain no deletes.
+#   - prod                 : Environment approval (CAB/service owner) + ManualValidation task that
+#                            points the approver at the what-if summary + no deletes.
+#   The approvers themselves live on the Environments (Pipelines > Environments), not in YAML,
+#   so changing an approver never requires a code change.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - arm-templates/**
+      - azure-devops-pipelines/arm-validate-deploy.yml
+      - azure-devops-pipelines/templates/**
+      - powershell/arm/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - arm-templates/**
+      - azure-devops-pipelines/arm-validate-deploy.yml
+      - azure-devops-pipelines/templates/**
+      - powershell/arm/**
+
+parameters:
+  - name: deployThroughTo
+    displayName: 'Deploy through to environment (later stages are skipped)'
+    type: string
+    default: prod
+    values: [dev, ite, iqe, preprod, prod]
+  - name: armTtkSkip
+    displayName: 'Additional ARM-TTK tests to skip (normally empty)'
+    type: object
+    default: []
+
+variables:
+  - group: dp-arm-common            # prodApprovers (ManualValidation notify list), shared tags
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # ======================================================================================
+  # Stage 1: Quality - the only stage that reads templates from source; everything after
+  # consumes the packaged artefact so all environments deploy byte-identical templates.
+  # ======================================================================================
+  - stage: Quality
+    displayName: 'Quality: ARM-TTK, static checks, package'
+    jobs:
+      - job: ArmTtk
+        displayName: 'ARM-TTK'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - template: templates/steps/arm-ttk.yml
+            parameters:
+              templatePath: arm-templates/templates
+              configFile: arm-templates/arm-ttk.config.json
+              skip: ${{ parameters.armTtkSkip }}
+
+      - job: StaticChecks
+        displayName: 'JSON lint, parameter parity, release plan'
+        steps:
+          - checkout: self
+            fetchDepth: 0            # full history so the release plan can list commits since main
+
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.11'
+            inputs:
+              versionSpec: '3.11'
+
+          # Parses every template and parameter file, checks the five parameter files share one
+          # shape, and checks main.json passes exactly what each module declares.
+          - script: python3 -I arm-templates/tests/check_templates.py --root arm-templates
+            displayName: 'Static template checks'
+
+          - task: PowerShell@2
+            displayName: 'Generate release plan (${{ parameters.deployThroughTo }})'
+            inputs:
+              pwsh: true
+              targetType: filePath
+              filePath: powershell/arm/New-ReleasePlan.ps1
+              arguments: >-
+                -ParameterFile 'arm-templates/parameters/main.${{ parameters.deployThroughTo }}.parameters.json'
+                -OutputPath '$(Build.ArtifactStagingDirectory)/release-plan/release-plan-${{ parameters.deployThroughTo }}-$(Build.BuildNumber).md'
+                -BaseRef 'origin/main'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish release plan'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/release-plan'
+              artifact: release-plan
+
+      - job: Package
+        displayName: 'Package templates'
+        dependsOn: [ArmTtk, StaticChecks]
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: CopyFiles@2
+            displayName: 'Stage arm-templates/'
+            inputs:
+              SourceFolder: arm-templates
+              Contents: |
+                templates/**/*.json
+                parameters/*.json
+                arm-ttk.config.json
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/arm-templates'
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish arm-templates artefact'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/arm-templates'
+              artifact: arm-templates
+
+  # ======================================================================================
+  # Pull requests: prove the change validates and show reviewers the dev what-if.
+  # No deployment job is created (validateOnly), so no Environment approval is consumed.
+  # ======================================================================================
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: dev
+      dependsOn: [Quality]
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+      validateOnly: true
+      serviceConnection: sc-dp-dataplatform-dev
+      resourceGroupName: rg-dp-dataplatform-dev-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-dev-uks
+      variableGroup: dp-arm-dev
+
+  # ======================================================================================
+  # Promotion chain (main branch only). Each stage depends on the previous one, and the
+  # deployThroughTo parameter lets an engineer stop a run early (for example to soak in iqe)
+  # without editing YAML. A skipped stage breaks the chain, so prod can never run without
+  # preprod having succeeded in the same run.
+  # ======================================================================================
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: dev
+      dependsOn: [Quality]
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+      serviceConnection: sc-dp-dataplatform-dev
+      resourceGroupName: rg-dp-dataplatform-dev-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-dev-uks
+      variableGroup: dp-arm-dev
+
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: ite
+      dependsOn: [Deploy_dev]
+      condition: and(succeeded(), ${{ in(parameters.deployThroughTo, 'ite', 'iqe', 'preprod', 'prod') }})
+      serviceConnection: sc-dp-dataplatform-ite
+      resourceGroupName: rg-dp-dataplatform-ite-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-ite-uks
+      variableGroup: dp-arm-ite
+
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: iqe
+      dependsOn: [Deploy_ite]
+      condition: and(succeeded(), ${{ in(parameters.deployThroughTo, 'iqe', 'preprod', 'prod') }})
+      serviceConnection: sc-dp-dataplatform-iqe
+      resourceGroupName: rg-dp-dataplatform-iqe-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-iqe-uks
+      variableGroup: dp-arm-iqe
+
+  # preprod mirrors prod: private endpoints on, geo-redundant storage, purge protection.
+  # failOnDelete turns an unexpected Delete in what-if into a failed stage, so a destructive
+  # change can never reach prod silently.
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: preprod
+      dependsOn: [Deploy_iqe]
+      condition: and(succeeded(), ${{ in(parameters.deployThroughTo, 'preprod', 'prod') }})
+      serviceConnection: sc-dp-dataplatform-preprod
+      resourceGroupName: rg-dp-dataplatform-preprod-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-preprod-uks
+      variableGroup: dp-arm-preprod
+      failOnDelete: true
+
+  # prod: the `prod` Environment carries the approval check (CAB / service owner) and a
+  # business-hours check for the change window. On top of that the ManualValidation task makes
+  # the approver open the what-if summary before the deployment job is even queued.
+  - template: templates/stages/arm-environment-stage.yml
+    parameters:
+      environment: prod
+      dependsOn: [Deploy_preprod]
+      condition: and(succeeded(), ${{ eq(parameters.deployThroughTo, 'prod') }})
+      serviceConnection: sc-dp-dataplatform-prod
+      resourceGroupName: rg-dp-dataplatform-prod-uks
+      templateSpecResourceGroup: rg-dp-templatespecs-prod-uks
+      variableGroup: dp-arm-prod
+      requireManualValidation: true
+      notifyUsers: $(prodApprovers)
+      failOnDelete: true

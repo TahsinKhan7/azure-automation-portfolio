@@ -1,0 +1,282 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Azure Data Factory with a managed virtual network and managed-VNet integration runtime, optional Azure DevOps Git integration, diagnostics, and baseline linked services to Key Vault and the data lake using the factory's managed identity.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "factoryName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Globally unique Data Factory name."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the factory."
+      }
+    },
+    "enableManagedVirtualNetwork": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Create a managed virtual network and run the AutoResolve integration runtime inside it so data movement never traverses the public internet."
+      }
+    },
+    "publicNetworkAccess": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Disabled requires a private endpoint to the factory for authoring and monitoring."
+      }
+    },
+    "enableGitConfiguration": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Attach the factory to an Azure DevOps Git repository. Only the development factory should be Git-backed; higher environments receive published ARM artefacts."
+      }
+    },
+    "gitAccountName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure DevOps organisation name. Required when enableGitConfiguration is true."
+      }
+    },
+    "gitProjectName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure DevOps project name."
+      }
+    },
+    "gitRepositoryName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure DevOps repository name."
+      }
+    },
+    "gitCollaborationBranch": {
+      "type": "string",
+      "defaultValue": "main",
+      "metadata": {
+        "description": "Collaboration branch used for publishing."
+      }
+    },
+    "gitRootFolder": {
+      "type": "string",
+      "defaultValue": "/adf",
+      "metadata": {
+        "description": "Root folder inside the repository that holds factory JSON."
+      }
+    },
+    "keyVaultName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the platform Key Vault for the AzureKeyVault linked service."
+      }
+    },
+    "keyVaultUri": {
+      "type": "string",
+      "metadata": {
+        "description": "Vault URI, e.g. https://kv-dp-dev-abc123.vault.azure.net/."
+      }
+    },
+    "dataLakeDfsEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "DFS endpoint of the ADLS Gen2 account, e.g. https://dpdevlakeabc123.dfs.core.windows.net/."
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace for diagnostics. Leave empty to skip diagnostic settings."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to the factory."
+      }
+    }
+  },
+  "variables": {
+    "factoryId": "[resourceId('Microsoft.DataFactory/factories', parameters('factoryName'))]",
+    "managedVnetName": "default",
+    "managedVnetId": "[resourceId('Microsoft.DataFactory/factories/managedVirtualNetworks', parameters('factoryName'), variables('managedVnetName'))]",
+    "integrationRuntimeName": "ir-managed-vnet-autoresolve",
+    "deployDiagnostics": "[not(empty(parameters('logAnalyticsWorkspaceId')))]",
+    "repoConfiguration": {
+      "type": "FactoryVSTSConfiguration",
+      "accountName": "[parameters('gitAccountName')]",
+      "projectName": "[parameters('gitProjectName')]",
+      "repositoryName": "[parameters('gitRepositoryName')]",
+      "collaborationBranch": "[parameters('gitCollaborationBranch')]",
+      "rootFolder": "[parameters('gitRootFolder')]",
+      "disablePublish": false
+    },
+    "diagnosticLogCategories": [
+      "ActivityRuns",
+      "PipelineRuns",
+      "TriggerRuns",
+      "SandboxPipelineRuns",
+      "SandboxActivityRuns"
+    ]
+  },
+  "resources": [
+    {
+      "type": "Microsoft.DataFactory/factories",
+      "apiVersion": "2018-06-01",
+      "name": "[parameters('factoryName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+        "repoConfiguration": "[if(parameters('enableGitConfiguration'), variables('repoConfiguration'), null())]",
+        "globalParameters": {
+          "keyVaultUri": {
+            "type": "String",
+            "value": "[parameters('keyVaultUri')]"
+          },
+          "dataLakeDfsEndpoint": {
+            "type": "String",
+            "value": "[parameters('dataLakeDfsEndpoint')]"
+          }
+        }
+      }
+    },
+    {
+      "condition": "[parameters('enableManagedVirtualNetwork')]",
+      "type": "Microsoft.DataFactory/factories/managedVirtualNetworks",
+      "apiVersion": "2018-06-01",
+      "name": "[format('{0}/{1}', parameters('factoryName'), variables('managedVnetName'))]",
+      "dependsOn": [
+        "[variables('factoryId')]"
+      ],
+      "properties": {}
+    },
+    {
+      "condition": "[parameters('enableManagedVirtualNetwork')]",
+      "type": "Microsoft.DataFactory/factories/integrationRuntimes",
+      "apiVersion": "2018-06-01",
+      "name": "[format('{0}/{1}', parameters('factoryName'), variables('integrationRuntimeName'))]",
+      "dependsOn": [
+        "[variables('managedVnetId')]"
+      ],
+      "properties": {
+        "type": "Managed",
+        "description": "AutoResolve runtime running inside the managed virtual network.",
+        "managedVirtualNetwork": {
+          "type": "ManagedVirtualNetworkReference",
+          "referenceName": "[variables('managedVnetName')]"
+        },
+        "typeProperties": {
+          "computeProperties": {
+            "location": "AutoResolve",
+            "dataFlowProperties": {
+              "computeType": "General",
+              "coreCount": 8,
+              "timeToLive": 10
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DataFactory/factories/linkedservices",
+      "apiVersion": "2018-06-01",
+      "name": "[format('{0}/ls_keyvault_{1}', parameters('factoryName'), parameters('keyVaultName'))]",
+      "dependsOn": [
+        "[variables('factoryId')]"
+      ],
+      "properties": {
+        "type": "AzureKeyVault",
+        "description": "Platform Key Vault. Other linked services resolve their secrets through this reference.",
+        "typeProperties": {
+          "baseUrl": "[parameters('keyVaultUri')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DataFactory/factories/linkedservices",
+      "apiVersion": "2018-06-01",
+      "name": "[format('{0}/ls_adls_datalake', parameters('factoryName'))]",
+      "dependsOn": [
+        "[variables('factoryId')]",
+        "[resourceId('Microsoft.DataFactory/factories/integrationRuntimes', parameters('factoryName'), variables('integrationRuntimeName'))]"
+      ],
+      "properties": {
+        "type": "AzureBlobFS",
+        "description": "Data lake accessed with the factory managed identity (Storage Blob Data Contributor assigned outside this template).",
+        "connectVia": "[if(parameters('enableManagedVirtualNetwork'), createObject('referenceName', variables('integrationRuntimeName'), 'type', 'IntegrationRuntimeReference'), null())]",
+        "typeProperties": {
+          "url": "[parameters('dataLakeDfsEndpoint')]"
+        }
+      }
+    },
+    {
+      "condition": "[variables('deployDiagnostics')]",
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[format('Microsoft.DataFactory/factories/{0}', parameters('factoryName'))]",
+      "name": "diag-to-log-analytics",
+      "dependsOn": [
+        "[variables('factoryId')]"
+      ],
+      "properties": {
+        "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+        "logAnalyticsDestinationType": "Dedicated",
+        "copy": [
+          {
+            "name": "logs",
+            "count": "[length(variables('diagnosticLogCategories'))]",
+            "input": {
+              "category": "[variables('diagnosticLogCategories')[copyIndex('logs')]]",
+              "enabled": true
+            }
+          }
+        ],
+        "metrics": [
+          {
+            "category": "AllMetrics",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "factoryId": {
+      "type": "string",
+      "value": "[variables('factoryId')]"
+    },
+    "factoryName": {
+      "type": "string",
+      "value": "[parameters('factoryName')]"
+    },
+    "principalId": {
+      "type": "string",
+      "value": "[reference(variables('factoryId'), '2018-06-01', 'Full').identity.principalId]"
+    },
+    "integrationRuntimeName": {
+      "type": "string",
+      "value": "[if(parameters('enableManagedVirtualNetwork'), variables('integrationRuntimeName'), 'AutoResolveIntegrationRuntime')]"
+    }
+  }
+}

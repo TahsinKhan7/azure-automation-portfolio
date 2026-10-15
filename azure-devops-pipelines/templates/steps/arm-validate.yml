@@ -1,0 +1,53 @@
+# Steps: ARM deployment validation (the API-side equivalent of `az deployment group validate`).
+#
+# Supply either templateSpecId (preferred, runtime value from the publish step) or templateFile.
+# Test-ArmDeployment.ps1 flattens nested error details and fails the task with -ThrowOnError.
+
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: resourceGroupName
+    type: string
+  - name: environment
+    type: string
+    values: [dev, ite, iqe, preprod, prod]
+  - name: parameterFile
+    type: string
+  - name: templateSpecId
+    type: string
+    default: ''
+  - name: templateFile
+    type: string
+    default: ''
+  - name: scriptPath
+    type: string
+    default: 'powershell/arm/Test-ArmDeployment.ps1'
+  - name: resultJsonPath
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)/validation/validation-result.json'
+
+steps:
+  - task: AzurePowerShell@5
+    name: ArmValidate
+    displayName: 'Validate deployment (${{ parameters.environment }})'
+    inputs:
+      azureSubscription: '${{ parameters.serviceConnection }}'
+      azurePowerShellVersion: LatestVersion
+      pwsh: true
+      ScriptType: FilePath
+      ScriptPath: '${{ parameters.scriptPath }}'
+      ScriptArguments: >-
+        -TemplateSpecId '${{ parameters.templateSpecId }}'
+        -TemplateFile '${{ parameters.templateFile }}'
+        -ParameterFile '${{ parameters.parameterFile }}'
+        -ResourceGroupName '${{ parameters.resourceGroupName }}'
+        -Environment '${{ parameters.environment }}'
+        -OutputJsonPath '${{ parameters.resultJsonPath }}'
+        -ThrowOnError
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish validation result'
+    condition: succeededOrFailed()
+    inputs:
+      targetPath: '${{ parameters.resultJsonPath }}'
+      artifact: 'validation-${{ parameters.environment }}'

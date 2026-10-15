@@ -1,0 +1,16 @@
+dataset: customers_silver
+description: Customer dimension source; one current row per customer with a valid email.
+expectations:
+  - type: not_null
+    columns: [customer_id, full_name]
+  - type: unique
+    columns: [customer_id]
+  - type: regex
+    column: email
+    pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    severity: warn
+  - type: accepted_values
+    column: segment
+    values: [retail, commercial, broker]
+  - type: row_count
+    min: 1

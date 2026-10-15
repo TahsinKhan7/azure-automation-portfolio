@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataplatform"
+version = "1.0.0"
+description = "Medallion lakehouse toolkit for Azure Databricks: PySpark transforms, Delta Lake SCD2, data quality gates and Databricks platform clients."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tahsin Khan" }]
+keywords = ["databricks", "pyspark", "delta-lake", "azure", "data-engineering", "medallion"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pyspark>=3.5,<4",
+    "delta-spark>=3.2,<4",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "azure-identity>=1.15",
+    "azure-keyvault-secrets>=4.7",
+    "databricks-sdk>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",
+    "responses>=0.25",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+dataplatform = "dataplatform.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+extend-exclude = ["build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+# N812: `from pyspark.sql import functions as F` is the idiomatic PySpark import.
+ignore = ["N812"]
+
+[tool.ruff.lint.per-file-ignores]
+# Databricks notebooks rely on injected globals (spark, dbutils) and widget-driven ordering.
+"notebooks/*" = ["F821", "E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dataplatform"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "spark: tests that start a local SparkSession (slower; require Java)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+log_cli = false
+
+[tool.coverage.run]
+source = ["dataplatform"]
+omit = ["*/notebooks/*"]

@@ -1,0 +1,29 @@
+# dataplatform configuration: iqe
+# Non-secret settings only. Secrets (tokens, connection strings) come from Key Vault
+# via the Databricks secret scope or DefaultAzureCredential at runtime.
+environment: iqe
+workspace_host: https://adb-0000000000000000.0.azuredatabricks.net
+key_vault_name: kv-dataplatform-iqe
+catalog: dataplatform_iqe
+
+storage:
+  account_name: stdataplatformiqe
+  containers:
+    landing: landing
+    bronze: bronze
+    silver: silver
+    gold: gold
+    quarantine: quarantine
+    checkpoints: checkpoints
+
+job:
+  shuffle_partitions: 64
+  max_retries: 2
+  timeout_minutes: 120
+  delta_retention_hours: 168
+  use_spot_instances: true
+  min_workers: 2
+  max_workers: 4
+  cluster_policy_name: dataplatform-iqe-jobs
+  spark_version: 15.4.x-scala2.12
+  node_type_id: Standard_D4ds_v5

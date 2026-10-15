@@ -1,0 +1,33 @@
+name: Release Drafter
+
+# Keeps a draft release up to date on every push to main and labels PRs from
+# their Conventional Commit title. pull_request_target is used so the
+# autolabeler can label PRs from forks; the job deliberately performs no
+# checkout, so no untrusted code runs with the elevated token.
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-drafter-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-release-draft:
+    name: Update release draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: release-drafter/release-drafter@v6
+        with:
+          config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

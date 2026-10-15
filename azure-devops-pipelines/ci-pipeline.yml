@@ -1,96 +1,171 @@
-# CI Pipeline - Build, Test, Lint, Publish Artifacts
-# Triggers on main and feature branches with quality gates
+# =============================================================================
+# dataplatform-ci : build, lint and test the Python package in python/
+# -----------------------------------------------------------------------------
+# - PR validation build for every pull request into main (branch policy)
+# - Publishes JUnit test results, Cobertura coverage and a versioned wheel that
+#   cd-pipeline.yml promotes through dev -> ite -> iqe -> preprod -> prod.
+# - Local PySpark 3.5 tests need a JVM, so Java 17 is installed on the agent.
+# =============================================================================
+name: ci-$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger:
+  batch: true
   branches:
     include:
       - main
-      - feature/*
   paths:
-    exclude:
-      - '*.md'
-      - docs/*
+    include:
+      - python/**
+      - azure-devops-pipelines/ci-pipeline.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - python/**
+      - azure-devops-pipelines/ci-pipeline.yml
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: pythonVersion
+    displayName: Python version
+    type: string
+    default: '3.11'
+  - name: coverageThreshold
+    displayName: Minimum line coverage (%)
+    type: number
+    default: 80
+  - name: notebooksSourceDir
+    displayName: Folder holding Databricks notebooks to ship with the wheel
+    type: string
+    default: databricks-bundles/src
 
 variables:
-  pythonVersion: '3.10'
-  artifactName: 'build-artifacts'
+  - name: packageDir
+    value: $(Build.SourcesDirectory)/python
+  - name: resultsDir
+    value: $(Build.SourcesDirectory)/test-results
+  - name: PIP_CACHE_DIR
+    value: $(Pipeline.Workspace)/.pip
+  - name: PYSPARK_PYTHON
+    value: python
+  - name: SPARK_LOCAL_IP
+    value: 127.0.0.1
 
 stages:
-
   - stage: Build
-    displayName: 'Build & Validate'
+    displayName: Build, lint and test
     jobs:
       - job: BuildAndTest
-        displayName: 'Build, Lint & Test'
+        displayName: ruff + pytest + wheel
+        timeoutInMinutes: 30
         steps:
+          - checkout: self
+            fetchDepth: 1
 
           - task: UsePythonVersion@0
+            displayName: Use Python ${{ parameters.pythonVersion }}
             inputs:
-              versionSpec: '$(pythonVersion)'
-            displayName: 'Set Python version'
+              versionSpec: ${{ parameters.pythonVersion }}
 
-          - script: |
+          - bash: |
+              set -euo pipefail
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq openjdk-17-jre-headless
+              JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
+              echo "##vso[task.setvariable variable=JAVA_HOME]${JAVA_HOME}"
+              java -version
+            displayName: Install Java 17 for local PySpark
+
+          - task: Cache@2
+            displayName: Cache pip downloads
+            inputs:
+              key: 'pip | "$(Agent.OS)" | ${{ parameters.pythonVersion }} | python/pyproject.toml'
+              restoreKeys: |
+                pip | "$(Agent.OS)" | ${{ parameters.pythonVersion }}
+              path: $(PIP_CACHE_DIR)
+
+          - bash: |
+              set -euo pipefail
               python -m pip install --upgrade pip
-              pip install -r requirements.txt
-              pip install flake8 pytest pytest-cov
-            displayName: 'Install dependencies'
+              pip install -e ".[dev]" pytest-cov build
+              pip list --format=columns
+            workingDirectory: $(packageDir)
+            displayName: Install package and development dependencies
 
-          - script: |
-              flake8 src/ --max-line-length=120 --statistics
-            displayName: 'Lint - flake8'
-            continueOnError: false
+          - bash: |
+              set -euo pipefail
+              ruff check . --output-format=azure
+              ruff format --check .
+            workingDirectory: $(packageDir)
+            displayName: Lint and formatting (ruff)
 
-          - script: |
-              pytest tests/ \
-                --junitxml=test-results.xml \
-                --cov=src \
-                --cov-report=xml:coverage.xml \
-                --cov-fail-under=80
-            displayName: 'Run unit tests with coverage'
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(resultsDir)"
+              pytest -q \
+                --junitxml="$(resultsDir)/python.xml" \
+                --cov=. \
+                --cov-report=xml:"$(resultsDir)/coverage.xml" \
+                --cov-report=term-missing \
+                --cov-fail-under=${{ parameters.coverageThreshold }}
+            workingDirectory: $(packageDir)
+            displayName: Unit tests with coverage (pytest)
 
           - task: PublishTestResults@2
+            displayName: Publish JUnit results
+            condition: succeededOrFailed()
             inputs:
-              testResultsFormat: 'JUnit'
-              testResultsFiles: 'test-results.xml'
-            displayName: 'Publish test results'
-            condition: always()
+              testResultsFormat: JUnit
+              testResultsFiles: $(resultsDir)/python.xml
+              testRunTitle: Python unit tests
+              failTaskOnFailedTests: true
 
           - task: PublishCodeCoverageResults@2
+            displayName: Publish coverage
+            condition: succeededOrFailed()
             inputs:
-              summaryFileLocation: 'coverage.xml'
-            displayName: 'Publish coverage'
-            condition: always()
+              summaryFileLocation: $(resultsDir)/coverage.xml
 
-          # Quality gate - fail if coverage below threshold
-          - script: |
-              python -c "
-              import xml.etree.ElementTree as ET
-              tree = ET.parse('coverage.xml')
-              rate = float(tree.getroot().attrib['line-rate']) * 100
-              print(f'Coverage: {rate:.1f}%')
-              if rate < 80:
-                  raise SystemExit(f'Coverage {rate:.1f}% below 80% threshold')
-              "
-            displayName: 'Quality gate - coverage check'
+          - bash: |
+              set -euo pipefail
+              python -m build --wheel --outdir "$(Build.ArtifactStagingDirectory)/wheel"
+              ls -l "$(Build.ArtifactStagingDirectory)/wheel"
+            workingDirectory: $(packageDir)
+            displayName: Build wheel
 
-  - stage: Package
-    displayName: 'Package Artifacts'
-    dependsOn: Build
-    condition: succeeded()
-    jobs:
-      - job: PublishArtifacts
-        steps:
-          - task: CopyFiles@2
+          - bash: |
+              set -euo pipefail
+              src="${{ parameters.notebooksSourceDir }}"
+              if [ -d "$src" ]; then
+                mkdir -p "$(Build.ArtifactStagingDirectory)/notebooks"
+                cp -R "$src"/. "$(Build.ArtifactStagingDirectory)/notebooks/"
+                find "$(Build.ArtifactStagingDirectory)/notebooks" -type f | sed 's#^#  #'
+              else
+                echo "##vso[task.logissue type=warning]Notebook folder ${src} not found; publishing wheel only."
+              fi
+            displayName: Stage notebooks
+
+          - bash: |
+              set -euo pipefail
+              cat > "$(Build.ArtifactStagingDirectory)/build-info.json" <<JSON
+              {
+                "buildId": "$(Build.BuildId)",
+                "buildNumber": "$(Build.BuildNumber)",
+                "sourceBranch": "$(Build.SourceBranch)",
+                "sourceVersion": "$(Build.SourceVersion)",
+                "python": "${{ parameters.pythonVersion }}"
+              }
+              JSON
+            displayName: Write build metadata
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish artefact "dataplatform-python"
             inputs:
-              sourceFolder: '$(Build.SourcesDirectory)/src'
-              contents: '**'
-              targetFolder: '$(Build.ArtifactStagingDirectory)/src'
-
-          - task: PublishBuildArtifacts@1
-            inputs:
-              pathToPublish: '$(Build.ArtifactStagingDirectory)'
-              artifactName: '$(artifactName)'
-            displayName: 'Publish build artifacts'
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: dataplatform-python
+              publishLocation: pipeline

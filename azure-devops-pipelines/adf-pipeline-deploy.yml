@@ -1,8 +1,30 @@
-# Azure Data Factory ARM Template Deployment Pipeline
-# Deploys ADF resources via ARM templates with pre/post deployment scripts
-# Handles linked service connections, triggers and pipeline definitions
+# =============================================================================
+# dataplatform-adf : build and deploy Azure Data Factory from source control
+# -----------------------------------------------------------------------------
+# Implements the Microsoft "automated publishing" pattern:
+#   Build          @microsoft/azure-data-factory-utilities validates the factory
+#                  JSON in the Git-integrated folder and exports the ARM template,
+#                  parameters and PrePostDeploymentScript.Ver2.ps1 as an artefact
+#   Deploy_<env>   what-if -> stop triggers (pre) -> ARM deploy (incremental)
+#                  -> start triggers + clean up removed resources (post)
+#
+# Environment-specific values (factory name, linked-service endpoints) come from
+# the dataplatform-adf-<env> variable group as ARM override parameters, so a
+# single template is promoted unchanged from dev to prod.
+# =============================================================================
+name: adf-$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - data-factory/**
+      - azure-devops-pipelines/adf-pipeline-deploy.yml
+
+pr:
   branches:
     include:
       - main
@@ -11,109 +33,213 @@ trigger:
       - data-factory/**
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 parameters:
-  - name: environment
+  - name: environments
+    displayName: Environments in promotion order
+    type: object
+    default:
+      - name: dev
+        serviceConnection: sc-dataplatform-dev
+        dependsOn: [Build]
+      - name: ite
+        serviceConnection: sc-dataplatform-ite
+        dependsOn: [Deploy_dev]
+      - name: iqe
+        serviceConnection: sc-dataplatform-iqe
+        dependsOn: [Deploy_ite]
+      - name: preprod
+        serviceConnection: sc-dataplatform-preprod
+        dependsOn: [Deploy_iqe]
+      - name: prod
+        serviceConnection: sc-dataplatform-prod
+        dependsOn: [Deploy_preprod]
+  - name: adfSourceDirectory
+    displayName: Folder containing the factory JSON (ADF Git integration root)
     type: string
-    default: 'dev'
-    values: [dev, prod]
+    default: data-factory
+  - name: deploy
+    displayName: Deploy after build (unticked = build and what-if only)
+    type: boolean
+    default: true
 
 variables:
-  - group: 'adf-${{ parameters.environment }}'
+  - name: artifactName
+    value: adf-arm-template
+  - name: armDir
+    value: $(Pipeline.Workspace)/$(artifactName)
 
 stages:
-
-  - stage: ValidateADF
-    displayName: 'Validate ADF Templates'
+  # ---------------------------------------------------------------------------
+  - stage: Build
+    displayName: Validate factory and export ARM template
+    variables:
+      # The dev factory is the "source" factory the utilities validate against.
+      - group: dataplatform-adf-dev
     jobs:
-      - job: Validate
+      - job: Build
+        displayName: adf-utilities validate + export
+        timeoutInMinutes: 20
         steps:
-          - task: AzureResourceManagerTemplateDeployment@3
+          - checkout: self
+            fetchDepth: 1
+
+          - task: NodeTool@0
+            displayName: Use Node.js 20
             inputs:
-              azureResourceManagerConnection: '$(azureServiceConnection)'
-              action: 'Create Or Update Resource Group'
-              resourceGroupName: '$(resourceGroup)'
-              location: '$(location)'
-              templateLocation: 'Linked artifact'
-              csmFile: 'data-factory/arm-template/ARMTemplateForFactory.json'
-              csmParametersFile: 'data-factory/arm-template/ARMTemplateParametersForFactory.json'
-              overrideParameters: '-factoryName $(adfName) -dataLake_accountKey $(dataLakeKey)'
-              deploymentMode: 'Validation'
-            displayName: 'Validate ARM template'
+              versionSpec: 20.x
 
-  - stage: DeployADF
-    displayName: 'Deploy ADF (${{ parameters.environment }})'
-    dependsOn: ValidateADF
-    jobs:
-      - deployment: DeployFactory
-        environment: 'adf-${{ parameters.environment }}'
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
+          - bash: |
+              set -euo pipefail
+              npm install --no-save --no-audit --no-fund @microsoft/azure-data-factory-utilities@1
+            workingDirectory: $(Build.SourcesDirectory)
+            displayName: Install ADF utilities
 
-                # Pre-deployment: stop triggers
-                - task: AzurePowerShell@5
-                  inputs:
-                    azureSubscription: '$(azureServiceConnection)'
-                    ScriptType: 'InlineScript'
-                    Inline: |
-                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
-                      foreach ($trigger in $triggers) {
-                        if ($trigger.RuntimeState -eq "Started") {
-                          Stop-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) `
-                            -DataFactoryName $(adfName) -Name $trigger.Name -Force
-                          Write-Host "Stopped trigger: $($trigger.Name)"
-                        }
-                      }
-                    azurePowerShellVersion: 'LatestVersion'
-                  displayName: 'Pre-deploy: Stop triggers'
+          - bash: |
+              set -euo pipefail
+              factory_id="/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.DataFactory/factories/$(adfName)"
+              node node_modules/@microsoft/azure-data-factory-utilities/lib/index validate \
+                "$(Build.SourcesDirectory)/${{ parameters.adfSourceDirectory }}" "$factory_id"
+            displayName: Validate factory resources
 
-                # Deploy ARM template
-                - task: AzureResourceManagerTemplateDeployment@3
-                  inputs:
-                    azureResourceManagerConnection: '$(azureServiceConnection)'
-                    action: 'Create Or Update Resource Group'
-                    resourceGroupName: '$(resourceGroup)'
-                    location: '$(location)'
-                    templateLocation: 'Linked artifact'
-                    csmFile: 'data-factory/arm-template/ARMTemplateForFactory.json'
-                    csmParametersFile: 'data-factory/arm-template/ARMTemplateParametersForFactory.json'
-                    overrideParameters: >-
-                      -factoryName $(adfName)
-                      -dataLake_accountKey $(dataLakeKey)
-                      -sqlServer_connectionString $(sqlConnectionString)
-                      -databricks_accessToken $(databricksToken)
-                    deploymentMode: 'Incremental'
-                  displayName: 'Deploy ADF ARM template'
+          - bash: |
+              set -euo pipefail
+              factory_id="/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.DataFactory/factories/$(adfName)"
+              node node_modules/@microsoft/azure-data-factory-utilities/lib/index export \
+                "$(Build.SourcesDirectory)/${{ parameters.adfSourceDirectory }}" "$factory_id" "$(Build.ArtifactStagingDirectory)"
+              ls -l "$(Build.ArtifactStagingDirectory)"
+              scripts/ci/validate-json.sh "$(Build.ArtifactStagingDirectory)"
+            displayName: Export ARM template
 
-                # Post-deployment: restart triggers
-                - task: AzurePowerShell@5
-                  inputs:
-                    azureSubscription: '$(azureServiceConnection)'
-                    ScriptType: 'InlineScript'
-                    Inline: |
-                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
-                      foreach ($trigger in $triggers) {
-                        if ($trigger.RuntimeState -eq "Stopped") {
-                          Start-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) `
-                            -DataFactoryName $(adfName) -Name $trigger.Name -Force
-                          Write-Host "Started trigger: $($trigger.Name)"
-                        }
-                      }
-                    azurePowerShellVersion: 'LatestVersion'
-                  displayName: 'Post-deploy: Restart triggers'
+          - task: PublishPipelineArtifact@1
+            displayName: Publish artefact "$(artifactName)"
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: $(artifactName)
+              publishLocation: pipeline
 
-                # Verify deployment
-                - task: AzurePowerShell@5
-                  inputs:
-                    azureSubscription: '$(azureServiceConnection)'
-                    ScriptType: 'InlineScript'
-                    Inline: |
-                      $pipelines = Get-AzDataFactoryV2Pipeline -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
-                      $triggers = Get-AzDataFactoryV2Trigger -ResourceGroupName $(resourceGroup) -DataFactoryName $(adfName)
-                      Write-Host "Deployed: $($pipelines.Count) pipelines, $($triggers.Count) triggers"
-                    azurePowerShellVersion: 'LatestVersion'
-                  displayName: 'Verify deployment'
+  # ---------------------------------------------------------------------------
+  - ${{ if eq(parameters.deploy, true) }}:
+      - ${{ each env in parameters.environments }}:
+          - stage: Deploy_${{ env.name }}
+            displayName: Deploy ADF to ${{ env.name }}
+            dependsOn: ${{ env.dependsOn }}
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            variables:
+              # Variable group per environment: subscriptionId, resourceGroup, location, adfName,
+              # adfOverrideParameters (ARM task format: -paramA valueA -paramB valueB).
+              - group: dataplatform-adf-${{ env.name }}
+            jobs:
+              - deployment: Deploy
+                displayName: ${{ env.name }}
+                environment: dataplatform-${{ env.name }}
+                timeoutInMinutes: 45
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - download: current
+                          artifact: $(artifactName)
+                          displayName: Download ARM template artefact
+
+                        - task: AzureCLI@2
+                          displayName: What-if
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            scriptType: bash
+                            scriptLocation: inlineScript
+                            workingDirectory: $(armDir)
+                            inlineScript: |
+                              set -euo pipefail
+                              # Convert "-name value" override syntax (ARM task) into "name=value" (az CLI).
+                              overrides=$(echo " $(adfOverrideParameters)" | sed -E 's/ -([A-Za-z0-9_]+) /\1=/g')
+                              # shellcheck disable=SC2086
+                              az deployment group what-if \
+                                --resource-group "$(resourceGroup)" \
+                                --template-file ARMTemplateForFactory.json \
+                                --parameters @ARMTemplateParametersForFactory.json \
+                                --parameters factoryName="$(adfName)" $overrides \
+                                --result-format FullResourcePayloads \
+                                --no-pretty-print > what-if.json
+                              jq -r '.changes[] | "\(.changeType)\t\(.resourceId | split("/") | .[-2:] | join("/"))"' what-if.json \
+                                | sort | column -t
+                              {
+                                echo "## ADF what-if: ${{ env.name }}"
+                                echo
+                                echo "| Change | Count |"
+                                echo "|---|---:|"
+                                jq -r '.changes | group_by(.changeType) | .[] | "| \(.[0].changeType) | \(length) |"' what-if.json
+                              } > what-if-summary.md
+                              echo "##vso[task.uploadsummary]$(armDir)/what-if-summary.md"
+
+                        - task: AzurePowerShell@5
+                          displayName: Pre-deployment (stop triggers)
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            azurePowerShellVersion: LatestVersion
+                            pwsh: true
+                            ScriptType: FilePath
+                            ScriptPath: $(armDir)/PrePostDeploymentScript.Ver2.ps1
+                            ScriptArguments: >-
+                              -armTemplate "$(armDir)/ARMTemplateForFactory.json"
+                              -ResourceGroupName "$(resourceGroup)"
+                              -DataFactoryName "$(adfName)"
+                              -predeployment $true
+                              -deleteDeployment $false
+
+                        - task: AzureResourceManagerTemplateDeployment@3
+                          displayName: Deploy ARM template (incremental)
+                          inputs:
+                            deploymentScope: Resource Group
+                            azureResourceManagerConnection: ${{ env.serviceConnection }}
+                            subscriptionId: $(subscriptionId)
+                            action: Create Or Update Resource Group
+                            resourceGroupName: $(resourceGroup)
+                            location: $(location)
+                            templateLocation: Linked artifact
+                            csmFile: $(armDir)/ARMTemplateForFactory.json
+                            csmParametersFile: $(armDir)/ARMTemplateParametersForFactory.json
+                            overrideParameters: -factoryName $(adfName) $(adfOverrideParameters)
+                            deploymentMode: Incremental
+                            deploymentName: adf-$(Build.BuildNumber)
+                            deploymentOutputs: adfDeploymentOutputs
+
+                        - task: AzurePowerShell@5
+                          displayName: Post-deployment (start triggers, remove deleted resources)
+                          # Runs even if the deployment failed so triggers are never left stopped.
+                          condition: succeededOrFailed()
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            azurePowerShellVersion: LatestVersion
+                            pwsh: true
+                            ScriptType: FilePath
+                            ScriptPath: $(armDir)/PrePostDeploymentScript.Ver2.ps1
+                            ScriptArguments: >-
+                              -armTemplate "$(armDir)/ARMTemplateForFactory.json"
+                              -ResourceGroupName "$(resourceGroup)"
+                              -DataFactoryName "$(adfName)"
+                              -predeployment $false
+                              -deleteDeployment $true
+
+                        - task: AzurePowerShell@5
+                          displayName: Verify factory state
+                          inputs:
+                            azureSubscription: ${{ env.serviceConnection }}
+                            azurePowerShellVersion: LatestVersion
+                            pwsh: true
+                            ScriptType: InlineScript
+                            Inline: |
+                              $ErrorActionPreference = 'Stop'
+                              $rg = '$(resourceGroup)'; $adf = '$(adfName)'
+                              $pipelines = @(Get-AzDataFactoryV2Pipeline -ResourceGroupName $rg -DataFactoryName $adf)
+                              $triggers  = @(Get-AzDataFactoryV2Trigger  -ResourceGroupName $rg -DataFactoryName $adf)
+                              $stopped   = @($triggers | Where-Object {
+                                $_.RuntimeState -ne 'Started' -and $_.Properties.PSObject.Properties['Pipelines']
+                              })
+                              Write-Host "Factory ${adf}: $($pipelines.Count) pipelines, $($triggers.Count) triggers"
+                              foreach ($t in $triggers) { Write-Host ("  {0,-40} {1}" -f $t.Name, $t.RuntimeState) }
+                              if ($stopped.Count -gt 0) {
+                                $msg = "$($stopped.Count) trigger(s) are not in Started state after deployment."
+                                Write-Host "##vso[task.logissue type=warning]${msg}"
+                              }

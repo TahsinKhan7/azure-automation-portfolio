@@ -1,118 +1,332 @@
-# Terraform Plan & Apply Pipeline
-# IaC deployment with plan output, manual approval, then apply
-# Supports multi-environment via variable groups and tfvars
+# =============================================================================
+# dataplatform-terraform : validate, plan and apply the Terraform roots
+# -----------------------------------------------------------------------------
+# Stages:
+#   Validate          fmt, validate (all modules + roots), tflint, checkov
+#   Plan_<env>        plan for every environment root in parallel; plan file,
+#                     JSON and a human summary are published as artefacts
+#   Apply_<env>       applies the saved plan (never re-plans) behind the
+#                     dataplatform-<env> Environment approval, in order
+#                     dev -> ite -> iqe -> preprod -> prod
+#
+# Authentication: Azure Resource Manager service connections configured for
+# workload identity federation. AzureCLI@2 with addSpnToEnvironment exposes the
+# federated token as $idToken, which Terraform consumes via ARM_USE_OIDC=true /
+# ARM_OIDC_TOKEN. No client secrets exist anywhere in this pipeline.
+#
+# State: azurerm backend, one container per subscription, key
+# dataplatform-<env>.tfstate, authenticated with Entra ID (use_azuread_auth) so
+# storage account keys stay disabled.
+# =============================================================================
+name: tf-$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger:
+  batch: true
   branches:
     include:
       - main
   paths:
     include:
       - terraform/**
+      - scripts/ci/terraform-validate-all.sh
+      - azure-devops-pipelines/terraform-plan-apply.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - scripts/ci/terraform-validate-all.sh
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 parameters:
-  - name: environment
-    type: string
-    default: 'dev'
-    values: [dev, prod]
+  - name: environments
+    displayName: Environments (plan runs for all; apply runs in this order)
+    type: object
+    default:
+      - name: dev
+        serviceConnection: sc-dataplatform-dev
+        applyDependsOn: [Plan_dev]
+      - name: ite
+        serviceConnection: sc-dataplatform-ite
+        applyDependsOn: [Plan_ite, Apply_dev]
+      - name: iqe
+        serviceConnection: sc-dataplatform-iqe
+        applyDependsOn: [Plan_iqe, Apply_ite]
+      - name: preprod
+        serviceConnection: sc-dataplatform-preprod
+        applyDependsOn: [Plan_preprod, Apply_iqe]
+      - name: prod
+        serviceConnection: sc-dataplatform-prod
+        applyDependsOn: [Plan_prod, Apply_preprod]
   - name: action
+    displayName: Action
     type: string
-    default: 'plan'
-    values: [plan, apply, destroy]
+    default: plan
+    values: [plan, apply]
+  - name: terraformVersion
+    type: string
+    default: '1.9.8'
+  - name: tflintVersion
+    type: string
+    default: v0.53.0
+  - name: checkovSoftFail
+    displayName: Report checkov findings without failing the build
+    type: boolean
+    default: false
 
 variables:
-  - group: 'terraform-${{ parameters.environment }}'
-  - name: tfWorkingDir
-    value: '$(System.DefaultWorkingDirectory)/terraform'
-  - name: tfVarsFile
-    value: 'environments/${{ parameters.environment }}.tfvars'
-  - name: tfBackendKey
-    value: '${{ parameters.environment }}.terraform.tfstate'
+  - name: tfRoot
+    value: $(Build.SourcesDirectory)/terraform
+  - name: TF_IN_AUTOMATION
+    value: 'true'
+  - name: TF_INPUT
+    value: '0'
+  - name: TF_PLUGIN_CACHE_DIR
+    value: $(Pipeline.Workspace)/.terraform.d/plugin-cache
+  # Boolean parameters render as True/False inside scripts, so the flag is resolved here instead.
+  - ${{ if eq(parameters.checkovSoftFail, true) }}:
+      - name: checkovExtraArgs
+        value: --soft-fail
+  - ${{ else }}:
+      - name: checkovExtraArgs
+        value: ''
 
 stages:
-
-  - stage: TerraformPlan
-    displayName: 'Terraform Plan (${{ parameters.environment }})'
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: fmt, validate, tflint, checkov
     jobs:
-      - job: Plan
+      - job: Validate
+        displayName: Static checks
+        timeoutInMinutes: 20
         steps:
+          - checkout: self
+            fetchDepth: 1
+
           - task: TerraformInstaller@1
+            displayName: Install Terraform ${{ parameters.terraformVersion }}
             inputs:
-              terraformVersion: 'latest'
-            displayName: 'Install Terraform'
+              terraformVersion: ${{ parameters.terraformVersion }}
 
-          - task: TerraformTaskV4@4
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
+              scripts/ci/terraform-validate-all.sh --fmt
+            displayName: terraform fmt -check and validate (all modules and roots)
+
+          - bash: |
+              set -euo pipefail
+              version="${{ parameters.tflintVersion }}"
+              base="https://github.com/terraform-linters/tflint/releases/download/${version}"
+              tmp=$(mktemp -d)
+              curl -fsSL --retry 3 -o "${tmp}/tflint_linux_amd64.zip" "${base}/tflint_linux_amd64.zip"
+              curl -fsSL --retry 3 -o "${tmp}/checksums.txt" "${base}/checksums.txt"
+              (cd "$tmp" && grep ' tflint_linux_amd64.zip$' checksums.txt | sha256sum --check --strict -)
+              unzip -q -o "${tmp}/tflint_linux_amd64.zip" -d "$tmp"
+              sudo install -m 0755 "${tmp}/tflint" /usr/local/bin/tflint
+              tflint --version
+              cd "$(tfRoot)"
+              tflint --init --config "$(tfRoot)/.tflint.hcl"
+              tflint --recursive --config "$(tfRoot)/.tflint.hcl" --format compact
+            displayName: tflint
+
+          - task: UsePythonVersion@0
+            displayName: Use Python 3.11 (checkov)
             inputs:
-              provider: 'azurerm'
-              command: 'init'
-              workingDirectory: '$(tfWorkingDir)'
-              backendServiceArm: '$(azureServiceConnection)'
-              backendAzureRmResourceGroupName: '$(tfStateRg)'
-              backendAzureRmStorageAccountName: '$(tfStateStorage)'
-              backendAzureRmContainerName: 'tfstate'
-              backendAzureRmKey: '$(tfBackendKey)'
-            displayName: 'Terraform Init'
+              versionSpec: '3.11'
 
-          - task: TerraformTaskV4@4
+          - bash: |
+              set -euo pipefail
+              pip install --quiet checkov
+              mkdir -p "$(Build.ArtifactStagingDirectory)/checkov"
+              checkov --version
+              # shellcheck disable=SC2086
+              checkov --directory "$(tfRoot)" --framework terraform \
+                --download-external-modules false \
+                --output cli --output junitxml \
+                --output-file-path "console,$(Build.ArtifactStagingDirectory)/checkov" \
+                $(checkovExtraArgs)
+            displayName: checkov (IaC security scan)
+
+          - task: PublishTestResults@2
+            displayName: Publish checkov results
+            condition: succeededOrFailed()
             inputs:
-              provider: 'azurerm'
-              command: 'validate'
-              workingDirectory: '$(tfWorkingDir)'
-            displayName: 'Terraform Validate'
+              testResultsFormat: JUnit
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/checkov/results_junitxml.xml
+              testRunTitle: checkov
+              failTaskOnFailedTests: false
 
-          - task: TerraformTaskV4@4
-            inputs:
-              provider: 'azurerm'
-              command: 'plan'
-              workingDirectory: '$(tfWorkingDir)'
-              commandOptions: '-var-file=$(tfVarsFile) -out=tfplan -detailed-exitcode'
-              environmentServiceNameAzureRM: '$(azureServiceConnection)'
-            displayName: 'Terraform Plan'
+  # ---------------------------------------------------------------------------
+  - ${{ each env in parameters.environments }}:
+      - stage: Plan_${{ env.name }}
+        displayName: Plan ${{ env.name }}
+        dependsOn: Validate
+        variables:
+          # Variable group per environment: tfStateResourceGroup, tfStateStorageAccount,
+          # tfStateContainer (see README.md).
+          - group: dataplatform-tf-${{ env.name }}
+          - name: tfDir
+            value: $(tfRoot)/environments/${{ env.name }}
+        jobs:
+          - job: Plan
+            displayName: terraform plan
+            timeoutInMinutes: 30
+            steps:
+              - checkout: self
+                fetchDepth: 1
 
-          - task: PublishBuildArtifacts@1
-            inputs:
-              pathToPublish: '$(tfWorkingDir)/tfplan'
-              artifactName: 'terraform-plan'
-            displayName: 'Publish plan artifact'
+              - task: TerraformInstaller@1
+                displayName: Install Terraform ${{ parameters.terraformVersion }}
+                inputs:
+                  terraformVersion: ${{ parameters.terraformVersion }}
 
-  - stage: TerraformApply
-    displayName: 'Terraform Apply (${{ parameters.environment }})'
-    dependsOn: TerraformPlan
-    condition: and(succeeded(), eq('${{ parameters.action }}', 'apply'))
-    jobs:
-      - deployment: Apply
-        environment: 'terraform-${{ parameters.environment }}'  # Manual approval gate
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - download: current
-                  artifact: 'terraform-plan'
+              - task: AzureCLI@2
+                name: plan
+                displayName: init + plan (OIDC)
+                inputs:
+                  azureSubscription: ${{ env.serviceConnection }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: $(tfDir)
+                  addSpnToEnvironment: true
+                  inlineScript: |
+                    set -euo pipefail
+                    export ARM_USE_OIDC=true
+                    export ARM_OIDC_TOKEN="$idToken"
+                    export ARM_CLIENT_ID="$servicePrincipalId"
+                    export ARM_TENANT_ID="$tenantId"
+                    ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                    export ARM_SUBSCRIPTION_ID
+                    mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
 
-                - task: TerraformInstaller@1
-                  inputs:
-                    terraformVersion: 'latest'
+                    terraform init -input=false -reconfigure \
+                      -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                      -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                      -backend-config="container_name=$(tfStateContainer)" \
+                      -backend-config="key=dataplatform-${{ env.name }}.tfstate" \
+                      -backend-config="use_oidc=true" \
+                      -backend-config="use_azuread_auth=true"
 
-                - task: TerraformTaskV4@4
-                  inputs:
-                    provider: 'azurerm'
-                    command: 'init'
-                    workingDirectory: '$(tfWorkingDir)'
-                    backendServiceArm: '$(azureServiceConnection)'
-                    backendAzureRmResourceGroupName: '$(tfStateRg)'
-                    backendAzureRmStorageAccountName: '$(tfStateStorage)'
-                    backendAzureRmContainerName: 'tfstate'
-                    backendAzureRmKey: '$(tfBackendKey)'
-                  displayName: 'Terraform Init'
+                    terraform validate -no-color
 
-                - task: TerraformTaskV4@4
-                  inputs:
-                    provider: 'azurerm'
-                    command: 'apply'
-                    workingDirectory: '$(tfWorkingDir)'
-                    commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplan'
-                    environmentServiceNameAzureRM: '$(azureServiceConnection)'
-                  displayName: 'Terraform Apply'
+                    set +e
+                    terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
+                    rc=$?
+                    set -e
+                    case "$rc" in
+                      0) has_changes=false ;;
+                      2) has_changes=true ;;
+                      *) echo "##vso[task.logissue type=error]terraform plan failed (exit ${rc})"; exit "$rc" ;;
+                    esac
+
+                    terraform show -no-color tfplan > plan.txt
+                    terraform show -json tfplan > plan.json
+                    adds=$(jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' plan.json)
+                    updates=$(jq '[.resource_changes[]? | select(.change.actions | index("update"))] | length' plan.json)
+                    deletes=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' plan.json)
+                    echo "Plan ${{ env.name }}: +${adds} ~${updates} -${deletes} (changes: ${has_changes})"
+                    if [ "$deletes" -gt 0 ]; then
+                      msg="Plan for ${{ env.name }} destroys ${deletes} resource(s); review plan.txt before approving apply."
+                      echo "##vso[task.logissue type=warning]${msg}"
+                    fi
+
+                    {
+                      echo "## Terraform plan: ${{ env.name }}"
+                      echo
+                      echo "| Add | Change | Destroy |"
+                      echo "|---:|---:|---:|"
+                      echo "| ${adds} | ${updates} | ${deletes} |"
+                      echo
+                      echo "<details><summary>plan output (first 400 lines)</summary>"
+                      echo
+                      echo '```'
+                      head -n 400 plan.txt
+                      echo '```'
+                      echo "</details>"
+                    } > plan-summary.md
+                    echo "##vso[task.uploadsummary]$(tfDir)/plan-summary.md"
+                    echo "##vso[task.setvariable variable=hasChanges;isOutput=true]${has_changes}"
+
+              - task: PublishPipelineArtifact@1
+                displayName: Publish plan artefact
+                inputs:
+                  targetPath: $(tfDir)
+                  artifact: tfplan-${{ env.name }}
+                  publishLocation: pipeline
+
+  # ---------------------------------------------------------------------------
+  - ${{ each env in parameters.environments }}:
+      - stage: Apply_${{ env.name }}
+        displayName: Apply ${{ env.name }}
+        dependsOn: ${{ env.applyDependsOn }}
+        condition: >-
+          and(succeeded(),
+              eq('${{ parameters.action }}', 'apply'),
+              eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+              eq(dependencies.Plan_${{ env.name }}.outputs['Plan.plan.hasChanges'], 'true'))
+        variables:
+          - group: dataplatform-tf-${{ env.name }}
+          - name: tfDir
+            value: $(Pipeline.Workspace)/tfplan-${{ env.name }}
+        jobs:
+          - deployment: Apply
+            displayName: terraform apply (saved plan)
+            environment: dataplatform-${{ env.name }}
+            timeoutInMinutes: 60
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - download: current
+                      artifact: tfplan-${{ env.name }}
+                      displayName: Download plan artefact
+
+                    - task: TerraformInstaller@1
+                      displayName: Install Terraform ${{ parameters.terraformVersion }}
+                      inputs:
+                        terraformVersion: ${{ parameters.terraformVersion }}
+
+                    - task: AzureCLI@2
+                      displayName: init + apply tfplan (OIDC)
+                      inputs:
+                        azureSubscription: ${{ env.serviceConnection }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        workingDirectory: $(tfDir)
+                        addSpnToEnvironment: true
+                        inlineScript: |
+                          set -euo pipefail
+                          export ARM_USE_OIDC=true
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_TENANT_ID="$tenantId"
+                          ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                          export ARM_SUBSCRIPTION_ID
+                          mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
+                          rm -rf .terraform
+
+                          terraform init -input=false -reconfigure \
+                            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                            -backend-config="container_name=$(tfStateContainer)" \
+                            -backend-config="key=dataplatform-${{ env.name }}.tfstate" \
+                            -backend-config="use_oidc=true" \
+                            -backend-config="use_azuread_auth=true"
+
+                          # Apply exactly the plan that was reviewed; never re-plan here.
+                          terraform apply -input=false -no-color -lock-timeout=5m tfplan
+
+                          {
+                            echo "## Terraform apply: ${{ env.name }}"
+                            echo
+                            echo '```'
+                            terraform output -no-color
+                            echo '```'
+                          } > apply-summary.md
+                          echo "##vso[task.uploadsummary]$(tfDir)/apply-summary.md"

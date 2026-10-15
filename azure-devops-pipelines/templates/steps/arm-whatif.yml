@@ -1,0 +1,58 @@
+# Steps: what-if analysis with a Markdown summary.
+#
+# Invoke-ArmWhatIf.ps1 attaches the Markdown to the run's summary tab (##vso[task.uploadsummary])
+# and exposes ArmWhatIf.whatIfDeleteCount / whatIfCreateCount / whatIfModifyCount as output
+# variables. failOnDelete turns unexpected deletes into a hard stop for preprod and prod.
+
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: resourceGroupName
+    type: string
+  - name: environment
+    type: string
+    values: [dev, ite, iqe, preprod, prod]
+  - name: parameterFile
+    type: string
+  - name: templateSpecId
+    type: string
+    default: ''
+  - name: templateFile
+    type: string
+    default: ''
+  - name: failOnDelete
+    type: boolean
+    default: false
+  - name: scriptPath
+    type: string
+    default: 'powershell/arm/Invoke-ArmWhatIf.ps1'
+  - name: outputDirectory
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)/whatif'
+
+steps:
+  - task: AzurePowerShell@5
+    name: ArmWhatIf
+    displayName: 'What-if (${{ parameters.environment }})'
+    inputs:
+      azureSubscription: '${{ parameters.serviceConnection }}'
+      azurePowerShellVersion: LatestVersion
+      pwsh: true
+      ScriptType: FilePath
+      ScriptPath: '${{ parameters.scriptPath }}'
+      ScriptArguments: >-
+        -TemplateSpecId '${{ parameters.templateSpecId }}'
+        -TemplateFile '${{ parameters.templateFile }}'
+        -ParameterFile '${{ parameters.parameterFile }}'
+        -ResourceGroupName '${{ parameters.resourceGroupName }}'
+        -Environment '${{ parameters.environment }}'
+        -OutputPath '${{ parameters.outputDirectory }}/whatif-${{ parameters.environment }}.md'
+        -DeploymentName 'dp-${{ parameters.environment }}-whatif-$(Build.BuildId)'
+        -FailOnDelete:$${{ parameters.failOnDelete }}
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish what-if summary'
+    condition: succeededOrFailed()
+    inputs:
+      targetPath: '${{ parameters.outputDirectory }}'
+      artifact: 'whatif-${{ parameters.environment }}'

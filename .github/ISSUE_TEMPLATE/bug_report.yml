@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in a script, module, template or pipeline does not behave as documented.
+title: "fix: <short description>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please do **not** include subscription IDs,
+        tenant IDs, tokens, connection strings or any other identifying data in this report.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the repository is affected?
+      options:
+        - python (PySpark / data quality / Databricks utilities)
+        - terraform
+        - arm-bicep
+        - arm-templates
+        - powershell
+        - kubernetes
+        - sql
+        - kql-queries
+        - azure-devops-pipelines
+        - github workflows
+        - docs
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - dev
+        - ite
+        - iqe
+        - preprod
+        - prod
+        - local / not environment specific
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `...`
+        2. Observe `...`
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or logs
+      description: Redact anything sensitive. This block is rendered as code automatically.
+      render: shell
+  - type: input
+    id: versions
+    attributes:
+      label: Tool versions
+      placeholder: "terraform 1.9.x, az 2.6x, pwsh 7.4, python 3.11, databricks cli 0.2xx"
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed all secrets and identifiers from this report.
+          required: true

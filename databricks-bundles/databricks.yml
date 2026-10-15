@@ -1,0 +1,144 @@
+# Databricks Asset Bundle for the dataplatform medallion lakehouse.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run      -t dev medallion_pipeline
+#
+# One bundle, five targets. Everything that differs between environments is a variable or a
+# target override; resource definitions under resources/ are shared and never edited per env.
+
+bundle:
+  name: dataplatform
+  # Pin the CLI so CI and laptops render the same deployment plan.
+  databricks_cli_version: ">= 0.230.0"
+
+include:
+  - resources/jobs/*.yml
+  - resources/pipelines/*.yml
+
+# Wheel built from ../python and attached to every job cluster.
+artifacts:
+  dataplatform_wheel:
+    type: whl
+    path: ../python
+    build: python -m build --wheel
+
+variables:
+  environment:
+    description: Short environment name used in catalog, storage and job names.
+    default: dev
+  catalog:
+    description: Unity Catalog catalog for this environment.
+    default: dataplatform_dev
+  storage_account:
+    description: ADLS Gen2 account hosting the lakehouse containers.
+    default: stdataplatformdev
+  spark_version:
+    description: Databricks Runtime for job clusters.
+    default: 15.4.x-scala2.12
+  node_type_id:
+    default: Standard_D4ds_v5
+  min_workers:
+    default: 1
+  max_workers:
+    default: 2
+  availability:
+    description: SPOT_WITH_FALLBACK_AZURE for non-prod cost savings, ON_DEMAND_AZURE for prod.
+    default: SPOT_WITH_FALLBACK_AZURE
+  cluster_policy_id:
+    description: Cost-control policy (resources/clusters/job_cluster_policy.json) created out of band.
+    default: "0000000000000000"
+  schedule_pause_status:
+    description: UNPAUSED only where the schedule should actually fire.
+    default: PAUSED
+  alert_email:
+    default: dataplatform-alerts@example.com
+  service_principal_name:
+    description: Application (client) ID of the deployment service principal.
+    default: "00000000-0000-0000-0000-000000000000"
+  config_dir:
+    description: Workspace path where python/config is synced.
+    default: /Workspace/Shared/dataplatform/config
+
+sync:
+  include:
+    - ../python/config/**
+    - ../python/notebooks/**
+
+targets:
+  dev:
+    default: true
+    mode: development          # resources are prefixed with [dev <user>] and schedules paused
+    workspace:
+      host: https://adb-0000000000000001.1.azuredatabricks.net
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      environment: dev
+      catalog: dataplatform_dev
+      storage_account: stdataplatformdev
+
+  ite:
+    mode: production
+    workspace:
+      host: https://adb-0000000000000002.2.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal_name}
+    variables:
+      environment: ite
+      catalog: dataplatform_ite
+      storage_account: stdataplatformite
+      max_workers: 4
+      schedule_pause_status: UNPAUSED
+
+  iqe:
+    mode: production
+    workspace:
+      host: https://adb-0000000000000003.3.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal_name}
+    variables:
+      environment: iqe
+      catalog: dataplatform_iqe
+      storage_account: stdataplatformiqe
+      min_workers: 2
+      max_workers: 4
+      schedule_pause_status: UNPAUSED
+
+  preprod:
+    mode: production
+    workspace:
+      host: https://adb-0000000000000004.4.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal_name}
+    variables:
+      environment: preprod
+      catalog: dataplatform_preprod
+      storage_account: stdataplatformpre
+      min_workers: 2
+      max_workers: 8
+      availability: ON_DEMAND_AZURE
+      schedule_pause_status: UNPAUSED
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-0000000000000005.5.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.service_principal_name}
+    permissions:
+      - level: CAN_MANAGE
+        group_name: dataplatform-engineers
+      - level: CAN_VIEW
+        group_name: dataplatform-analysts
+    variables:
+      environment: prod
+      catalog: dataplatform_prod
+      storage_account: stdataplatformprod
+      min_workers: 2
+      max_workers: 12
+      availability: ON_DEMAND_AZURE
+      schedule_pause_status: UNPAUSED
