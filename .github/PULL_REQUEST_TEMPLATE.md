@@ -47,7 +47,7 @@ Paste or link the evidence that proves this change is safe. Remove rows that do 
 ## Checklist
 
 - [ ] No secrets, connection strings, subscription or tenant identifiers are committed
-- [ ] Naming follows `dataplatform-<env>-<resource>` conventions and tags are set
+- [ ] Naming follows the `<type>-dp-<workload>-<env>` convention from the naming module and tags are set
 - [ ] New or changed resources are covered by Terraform/Bicep validation and (where relevant) tests
 - [ ] Documentation and READMEs updated for anything a reviewer or operator needs to know
 - [ ] Breaking changes are called out in the summary and the PR title follows Conventional Commits
