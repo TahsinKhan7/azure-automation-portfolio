@@ -195,7 +195,7 @@
   "resources": [
     {
       "type": "Microsoft.Network/networkSecurityGroups",
-      "apiVersion": "2023-11-01",
+      "apiVersion": "2025-05-01",
       "name": "[parameters('nsgName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
@@ -224,7 +224,7 @@
     },
     {
       "type": "Microsoft.Network/virtualNetworks",
-      "apiVersion": "2023-11-01",
+      "apiVersion": "2025-05-01",
       "name": "[parameters('vnetName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",

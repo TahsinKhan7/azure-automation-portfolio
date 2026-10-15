@@ -88,9 +88,6 @@
     },
     "secretsObject": {
       "type": "secureObject",
-      "defaultValue": {
-        "secrets": []
-      },
       "metadata": {
         "description": "Object with a 'secrets' array of { secretName, secretValue, contentType } items to seed into the vault."
       }
@@ -119,7 +116,7 @@
   "resources": [
     {
       "type": "Microsoft.KeyVault/vaults",
-      "apiVersion": "2023-07-01",
+      "apiVersion": "2025-05-01",
       "name": "[parameters('keyVaultName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
@@ -162,7 +159,7 @@
     },
     {
       "type": "Microsoft.KeyVault/vaults/secrets",
-      "apiVersion": "2023-07-01",
+      "apiVersion": "2025-05-01",
       "name": "[format('{0}/{1}', parameters('keyVaultName'), parameters('secretsObject').secrets[copyIndex()].secretName)]",
       "dependsOn": [
         "[variables('keyVaultId')]"
@@ -182,7 +179,7 @@
     {
       "condition": "[parameters('deployPrivateEndpoint')]",
       "type": "Microsoft.Network/privateEndpoints",
-      "apiVersion": "2023-11-01",
+      "apiVersion": "2025-05-01",
       "name": "[variables('privateEndpointName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",

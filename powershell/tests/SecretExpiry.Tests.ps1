@@ -26,7 +26,8 @@ Describe 'Get-DpSecretExpiryStatus' {
 
 Describe 'Get-DpKeyVaultSecretInventory' {
     It 'lists secrets with their expiry classification using only metadata calls' {
-        Mock -CommandName Get-AzKeyVaultSecret -ModuleName $script:ModuleName -ParameterFilter { -not $Name } -MockWith {
+        # Default (unfiltered) mock answers the vault-level listing call; the Name-filtered mocks below answer the per-secret metadata calls.
+        Mock -CommandName Get-AzKeyVaultSecret -ModuleName $script:ModuleName -MockWith {
             @([pscustomobject]@{ Name = 'sql-conn' }, [pscustomobject]@{ Name = 'api-key' })
         }
         Mock -CommandName Get-AzKeyVaultSecret -ModuleName $script:ModuleName -ParameterFilter { $Name -eq 'sql-conn' } -MockWith {

@@ -354,6 +354,8 @@ jobs:
           # Optional comma-separated list of ARM-TTK tests to skip, set as a repository variable.
           ARM_TTK_SKIP: ${{ vars.ARM_TTK_SKIP }}
         run: |
+          # GitHub-hosted pwsh sets $ErrorActionPreference = 'Stop'; keep going so every template is reported.
+          $ErrorActionPreference = 'Continue'
           Import-Module "$env:RUNNER_TEMP/arm-ttk/arm-ttk/arm-ttk.psd1" -Force
 
           $schemaPattern = '"\$schema"\s*:\s*"https://schema\.management\.azure\.com/schemas/[^"]*deploymentTemplate\.json#?"'

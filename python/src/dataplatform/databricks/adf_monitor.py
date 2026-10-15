@@ -23,7 +23,8 @@ API_VERSION = "2018-06-01"
 
 
 class TokenCredential(Protocol):
-    def get_token(self, *scopes: str, **kwargs: Any) -> Any: ...
+    def get_token(self, *scopes: str, **kwargs: Any) -> Any:
+        """Return an access token for the requested scopes."""
 
 
 @dataclass(frozen=True)

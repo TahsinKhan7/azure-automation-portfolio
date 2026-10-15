@@ -132,7 +132,7 @@
   "resources": [
     {
       "type": "Microsoft.Databricks/workspaces",
-      "apiVersion": "2024-05-01",
+      "apiVersion": "2026-01-01",
       "name": "[parameters('workspaceName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",

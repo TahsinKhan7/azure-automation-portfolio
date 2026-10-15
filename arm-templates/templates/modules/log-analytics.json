@@ -61,6 +61,7 @@
       "type": "int",
       "defaultValue": -1,
       "minValue": -1,
+      "maxValue": 5000,
       "metadata": {
         "description": "Daily ingestion cap in GB. Use -1 for no cap. A cap protects non-production budgets from runaway logging."
       }
@@ -128,7 +129,7 @@
   "resources": [
     {
       "type": "Microsoft.OperationalInsights/workspaces",
-      "apiVersion": "2023-09-01",
+      "apiVersion": "2025-07-01",
       "name": "[parameters('workspaceName')]",
       "location": "[parameters('location')]",
       "tags": "[parameters('tags')]",
@@ -148,7 +149,7 @@
     },
     {
       "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
-      "apiVersion": "2020-08-01",
+      "apiVersion": "2025-07-01",
       "name": "[format('{0}/{1}', parameters('workspaceName'), variables('savedSearches')[copyIndex()].name)]",
       "dependsOn": [
         "[variables('workspaceId')]"

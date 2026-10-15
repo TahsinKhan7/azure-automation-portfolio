@@ -79,7 +79,7 @@
         "198.51.100.42"
       ]
     },
-    "keyVaultSecretsUserPrincipalIds": {
+    "keyVaultReaderPrincipalIds": {
       "value": []
     },
     "servicePrincipalClientSecret": {
