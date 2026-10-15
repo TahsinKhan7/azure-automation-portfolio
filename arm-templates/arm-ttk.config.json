@@ -1,0 +1,20 @@
+{
+  "$comment": "Consumed by powershell/arm/Invoke-ArmTtk.ps1. Every skipped test must carry a reason so the exemption is reviewable in pull requests.",
+  "armTtk": {
+    "repository": "https://github.com/Azure/arm-ttk",
+    "ref": "20240328",
+    "mainTemplateFile": "main.json"
+  },
+  "skip": [
+    {
+      "test": "IDs Should Be Derived From ResourceIDs",
+      "reason": "Modules receive subnet, workspace and vault resource IDs as string parameters from the orchestrator, which this test cannot trace across templateLink boundaries. IDs are built with resourceId() in main.json."
+    },
+    {
+      "test": "Template Should Not Contain Blanks",
+      "reason": "Optional module parameters (privateEndpointSubnetId, logAnalyticsWorkspaceId, Git settings) default to an empty string or array on purpose; the matching resources are guarded with condition expressions."
+    }
+  ],
+  "failOnWarnings": false,
+  "resultsFile": "TestResults/arm-ttk-results.xml"
+}

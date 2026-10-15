@@ -1,0 +1,214 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Azure Databricks workspace deployed with VNet injection and secure cluster connectivity (no public IP), premium tier for Unity Catalog and RBAC features, and diagnostics to Log Analytics.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "workspaceName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Name of the Databricks workspace."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the workspace. Must match the virtual network region."
+      }
+    },
+    "pricingTier": {
+      "type": "string",
+      "defaultValue": "premium",
+      "allowedValues": [
+        "standard",
+        "premium",
+        "trial"
+      ],
+      "metadata": {
+        "description": "Workspace SKU. Premium is required for Unity Catalog, credential passthrough and workspace-level RBAC."
+      }
+    },
+    "managedResourceGroupName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the locked managed resource group that Databricks creates for workspace infrastructure."
+      }
+    },
+    "vnetId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the virtual network the workspace is injected into."
+      }
+    },
+    "publicSubnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the host (public) subnet delegated to Microsoft.Databricks/workspaces."
+      }
+    },
+    "privateSubnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the container (private) subnet delegated to Microsoft.Databricks/workspaces."
+      }
+    },
+    "enableNoPublicIp": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Secure cluster connectivity: cluster nodes get no public IP and reach the control plane outbound only."
+      }
+    },
+    "publicNetworkAccess": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Disabled requires front-end Private Link to the workspace UI and APIs."
+      }
+    },
+    "requiredNsgRules": {
+      "type": "string",
+      "defaultValue": "AllRules",
+      "allowedValues": [
+        "AllRules",
+        "NoAzureDatabricksRules",
+        "NoAzureServiceRules"
+      ],
+      "metadata": {
+        "description": "Which outbound rules Databricks manages on the subnet NSG. NoAzureDatabricksRules is used with back-end Private Link."
+      }
+    },
+    "storageAccountSkuName": {
+      "type": "string",
+      "defaultValue": "Standard_GRS",
+      "allowedValues": [
+        "Standard_LRS",
+        "Standard_GRS",
+        "Standard_ZRS"
+      ],
+      "metadata": {
+        "description": "Replication for the DBFS root storage account inside the managed resource group."
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace for diagnostics. Leave empty to skip diagnostic settings."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to the workspace. Databricks propagates them to the managed resource group."
+      }
+    }
+  },
+  "variables": {
+    "workspaceId": "[resourceId('Microsoft.Databricks/workspaces', parameters('workspaceName'))]",
+    "managedResourceGroupId": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('managedResourceGroupName'))]",
+    "deployDiagnostics": "[not(empty(parameters('logAnalyticsWorkspaceId')))]",
+    "diagnosticLogCategories": [
+      "clusters",
+      "jobs",
+      "notebook",
+      "workspace",
+      "accounts",
+      "secrets",
+      "sqlPermissions",
+      "unityCatalog",
+      "dbfs"
+    ]
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Databricks/workspaces",
+      "apiVersion": "2024-05-01",
+      "name": "[parameters('workspaceName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "sku": {
+        "name": "[parameters('pricingTier')]"
+      },
+      "properties": {
+        "managedResourceGroupId": "[variables('managedResourceGroupId')]",
+        "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+        "requiredNsgRules": "[parameters('requiredNsgRules')]",
+        "parameters": {
+          "customVirtualNetworkId": {
+            "value": "[parameters('vnetId')]"
+          },
+          "customPublicSubnetName": {
+            "value": "[parameters('publicSubnetName')]"
+          },
+          "customPrivateSubnetName": {
+            "value": "[parameters('privateSubnetName')]"
+          },
+          "enableNoPublicIp": {
+            "value": "[parameters('enableNoPublicIp')]"
+          },
+          "storageAccountSkuName": {
+            "value": "[parameters('storageAccountSkuName')]"
+          },
+          "prepareEncryption": {
+            "value": true
+          }
+        }
+      }
+    },
+    {
+      "condition": "[variables('deployDiagnostics')]",
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[format('Microsoft.Databricks/workspaces/{0}', parameters('workspaceName'))]",
+      "name": "diag-to-log-analytics",
+      "dependsOn": [
+        "[variables('workspaceId')]"
+      ],
+      "properties": {
+        "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+        "copy": [
+          {
+            "name": "logs",
+            "count": "[length(variables('diagnosticLogCategories'))]",
+            "input": {
+              "category": "[variables('diagnosticLogCategories')[copyIndex('logs')]]",
+              "enabled": true
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "workspaceResourceId": {
+      "type": "string",
+      "value": "[variables('workspaceId')]"
+    },
+    "workspaceName": {
+      "type": "string",
+      "value": "[parameters('workspaceName')]"
+    },
+    "workspaceUrl": {
+      "type": "string",
+      "value": "[reference(variables('workspaceId'), '2024-05-01').workspaceUrl]"
+    },
+    "workspaceId": {
+      "type": "string",
+      "value": "[reference(variables('workspaceId'), '2024-05-01').workspaceId]"
+    },
+    "managedResourceGroupId": {
+      "type": "string",
+      "value": "[variables('managedResourceGroupId')]"
+    }
+  }
+}

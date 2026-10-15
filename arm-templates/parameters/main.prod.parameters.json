@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "value": "prod"
+    },
+    "platformName": {
+      "value": "dataplatform"
+    },
+    "orgPrefix": {
+      "value": "dp"
+    },
+    "location": {
+      "value": "uksouth"
+    },
+    "vnetAddressPrefix": {
+      "value": "10.30.0.0/16"
+    },
+    "databricksPublicSubnetPrefix": {
+      "value": "10.30.0.0/22"
+    },
+    "databricksPrivateSubnetPrefix": {
+      "value": "10.30.4.0/22"
+    },
+    "privateEndpointSubnetPrefix": {
+      "value": "10.30.8.0/24"
+    },
+    "storageSkuName": {
+      "value": "Standard_RAGZRS"
+    },
+    "storageContainerNames": {
+      "value": [
+        "landing",
+        "bronze",
+        "silver",
+        "gold"
+      ]
+    },
+    "coolTierAfterDays": {
+      "value": 30
+    },
+    "deleteLandingAfterDays": {
+      "value": 180
+    },
+    "logRetentionInDays": {
+      "value": 365
+    },
+    "logDailyQuotaGb": {
+      "value": -1
+    },
+    "keyVaultSkuName": {
+      "value": "premium"
+    },
+    "enableKeyVaultPurgeProtection": {
+      "value": true
+    },
+    "databricksPricingTier": {
+      "value": "premium"
+    },
+    "enableDataFactoryGit": {
+      "value": false
+    },
+    "dataFactoryGit": {
+      "value": {
+        "accountName": "",
+        "projectName": "",
+        "repositoryName": "",
+        "collaborationBranch": "main",
+        "rootFolder": "/adf"
+      }
+    },
+    "deployPrivateEndpoints": {
+      "value": true
+    },
+    "allowedIpRanges": {
+      "value": [
+        "203.0.113.0/24",
+        "198.51.100.42"
+      ]
+    },
+    "keyVaultSecretsUserPrincipalIds": {
+      "value": []
+    },
+    "servicePrincipalClientSecret": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dp-bootstrap-prod-uks/providers/Microsoft.KeyVault/vaults/kv-dp-bootstrap-prod"
+        },
+        "secretName": "dataplatform-sp-client-secret"
+      }
+    },
+    "tags": {
+      "value": {
+        "costCentre": "CC-4301",
+        "owner": "data-platform-engineering",
+        "dataClassification": "confidential",
+        "changeWindow": "Tue/Thu 19:00-22:00 (CAB approved)",
+        "repository": "azure-automation-portfolio"
+      }
+    }
+  }
+}

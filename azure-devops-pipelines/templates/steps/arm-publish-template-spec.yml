@@ -1,0 +1,59 @@
+# Steps: publish main.json and its linked modules as a Template Spec version.
+#
+# `az ts create` packages every template referenced through templateLink.relativePath, so the
+# whole module tree ships as one immutable, versioned artefact per environment subscription.
+# The resulting resource ID is exposed as the output variable PublishTemplateSpec.templateSpecId.
+
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: templateSpecName
+    type: string
+    default: 'dataplatform-landing-zone'
+  - name: templateSpecResourceGroup
+    type: string
+  - name: location
+    type: string
+    default: 'uksouth'
+  - name: version
+    type: string
+    default: '$(Build.BuildNumber)'
+  - name: templateFile
+    type: string
+    default: '$(Pipeline.Workspace)/arm-templates/templates/main.json'
+  - name: stepName
+    type: string
+    default: 'PublishTemplateSpec'
+
+steps:
+  - task: AzureCLI@2
+    name: ${{ parameters.stepName }}
+    displayName: 'Publish Template Spec ${{ parameters.templateSpecName }} v${{ parameters.version }}'
+    inputs:
+      azureSubscription: '${{ parameters.serviceConnection }}'
+      scriptType: bash
+      scriptLocation: inlineScript
+      failOnStandardError: false
+      inlineScript: |
+        set -euo pipefail
+
+        az group create \
+          --name "${{ parameters.templateSpecResourceGroup }}" \
+          --location "${{ parameters.location }}" \
+          --tags platform=dataplatform purpose=template-specs managedBy=pipeline \
+          --output none
+
+        # --yes overwrites a version re-published by a pipeline re-run; the Build.BuildNumber
+        # is unique per run so this never clobbers a different commit.
+        specId=$(az ts create \
+          --name "${{ parameters.templateSpecName }}" \
+          --version "${{ parameters.version }}" \
+          --resource-group "${{ parameters.templateSpecResourceGroup }}" \
+          --location "${{ parameters.location }}" \
+          --template-file "${{ parameters.templateFile }}" \
+          --version-description "Commit $(Build.SourceVersion) from $(Build.SourceBranchName)" \
+          --yes \
+          --query id --output tsv)
+
+        echo "Template Spec version: ${specId}"
+        echo "##vso[task.setvariable variable=templateSpecId;isOutput=true]${specId}"

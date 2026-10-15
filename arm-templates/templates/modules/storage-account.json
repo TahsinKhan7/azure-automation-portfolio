@@ -1,0 +1,401 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "ADLS Gen2 data lake account with medallion containers, lifecycle tiering, network rules, diagnostics and optional private endpoints for the blob and dfs endpoints.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique storage account name: lowercase letters and digits only."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the storage account."
+      }
+    },
+    "skuName": {
+      "type": "string",
+      "defaultValue": "Standard_LRS",
+      "allowedValues": [
+        "Standard_LRS",
+        "Standard_ZRS",
+        "Standard_GRS",
+        "Standard_RAGRS",
+        "Standard_GZRS",
+        "Standard_RAGZRS"
+      ],
+      "metadata": {
+        "description": "Replication type. Non-production uses LRS; production uses zone or geo redundancy."
+      }
+    },
+    "accessTier": {
+      "type": "string",
+      "defaultValue": "Hot",
+      "allowedValues": [
+        "Hot",
+        "Cool"
+      ],
+      "metadata": {
+        "description": "Default access tier for blobs that are not explicitly tiered by the lifecycle policy."
+      }
+    },
+    "containerNames": {
+      "type": "array",
+      "defaultValue": [
+        "landing",
+        "bronze",
+        "silver",
+        "gold"
+      ],
+      "metadata": {
+        "description": "Containers (filesystems) to create. Defaults to the medallion layout."
+      }
+    },
+    "coolTierAfterDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 1,
+      "metadata": {
+        "description": "Days since last modification before landing and bronze blobs move to the Cool tier."
+      }
+    },
+    "deleteLandingAfterDays": {
+      "type": "int",
+      "defaultValue": 90,
+      "minValue": 1,
+      "metadata": {
+        "description": "Days since last modification before blobs in the landing container are deleted. Raw data is retained in bronze."
+      }
+    },
+    "softDeleteRetentionDays": {
+      "type": "int",
+      "defaultValue": 7,
+      "minValue": 1,
+      "maxValue": 365,
+      "metadata": {
+        "description": "Retention for blob and container soft delete."
+      }
+    },
+    "allowSharedKeyAccess": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Permit account key authentication. Keep false so all access uses Entra ID and RBAC."
+      }
+    },
+    "networkDefaultAction": {
+      "type": "string",
+      "defaultValue": "Deny",
+      "allowedValues": [
+        "Allow",
+        "Deny"
+      ],
+      "metadata": {
+        "description": "Default firewall action. Deny restricts access to the listed IP ranges, subnets and trusted Azure services."
+      }
+    },
+    "allowedIpRanges": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Public IPv4 addresses or CIDR ranges permitted through the storage firewall, e.g. office egress ranges."
+      }
+    },
+    "allowedSubnetIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Subnet resource IDs permitted through the storage firewall via service endpoints."
+      }
+    },
+    "deployPrivateEndpoints": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Create private endpoints for the blob and dfs sub-resources. DNS registration is handled centrally by the hub Private DNS policy."
+      }
+    },
+    "privateEndpointSubnetId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the subnet that hosts the private endpoints. Required when deployPrivateEndpoints is true."
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace for diagnostics. Leave empty to skip diagnostic settings."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to every resource in this module."
+      }
+    }
+  },
+  "variables": {
+    "storageAccountId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+    "blobServiceId": "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]",
+    "privateEndpointGroups": [
+      "blob",
+      "dfs"
+    ],
+    "deployDiagnostics": "[not(empty(parameters('logAnalyticsWorkspaceId')))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "kind": "StorageV2",
+      "sku": {
+        "name": "[parameters('skuName')]"
+      },
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "accessTier": "[parameters('accessTier')]",
+        "isHnsEnabled": true,
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true,
+        "allowBlobPublicAccess": false,
+        "allowSharedKeyAccess": "[parameters('allowSharedKeyAccess')]",
+        "allowCrossTenantReplication": false,
+        "defaultToOAuthAuthentication": true,
+        "publicNetworkAccess": "[if(parameters('deployPrivateEndpoints'), 'Disabled', 'Enabled')]",
+        "encryption": {
+          "keySource": "Microsoft.Storage",
+          "requireInfrastructureEncryption": true,
+          "services": {
+            "blob": {
+              "enabled": true,
+              "keyType": "Account"
+            },
+            "file": {
+              "enabled": true,
+              "keyType": "Account"
+            }
+          }
+        },
+        "networkAcls": {
+          "bypass": "AzureServices",
+          "defaultAction": "[parameters('networkDefaultAction')]",
+          "copy": [
+            {
+              "name": "ipRules",
+              "count": "[length(parameters('allowedIpRanges'))]",
+              "input": {
+                "value": "[parameters('allowedIpRanges')[copyIndex('ipRules')]]",
+                "action": "Allow"
+              }
+            },
+            {
+              "name": "virtualNetworkRules",
+              "count": "[length(parameters('allowedSubnetIds'))]",
+              "input": {
+                "id": "[parameters('allowedSubnetIds')[copyIndex('virtualNetworkRules')]]",
+                "action": "Allow"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default', parameters('storageAccountName'))]",
+      "dependsOn": [
+        "[variables('storageAccountId')]"
+      ],
+      "properties": {
+        "deleteRetentionPolicy": {
+          "enabled": true,
+          "days": "[parameters('softDeleteRetentionDays')]"
+        },
+        "containerDeleteRetentionPolicy": {
+          "enabled": true,
+          "days": "[parameters('softDeleteRetentionDays')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default/{1}', parameters('storageAccountName'), parameters('containerNames')[copyIndex()])]",
+      "dependsOn": [
+        "[variables('blobServiceId')]"
+      ],
+      "copy": {
+        "name": "containerLoop",
+        "count": "[length(parameters('containerNames'))]"
+      },
+      "properties": {
+        "publicAccess": "None",
+        "metadata": {
+          "layer": "[parameters('containerNames')[copyIndex()]]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default', parameters('storageAccountName'))]",
+      "dependsOn": [
+        "containerLoop"
+      ],
+      "properties": {
+        "policy": {
+          "rules": [
+            {
+              "name": "tier-raw-layers-to-cool",
+              "enabled": true,
+              "type": "Lifecycle",
+              "definition": {
+                "filters": {
+                  "blobTypes": [
+                    "blockBlob"
+                  ],
+                  "prefixMatch": [
+                    "landing/",
+                    "bronze/"
+                  ]
+                },
+                "actions": {
+                  "baseBlob": {
+                    "tierToCool": {
+                      "daysAfterModificationGreaterThan": "[parameters('coolTierAfterDays')]"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "expire-landing-zone",
+              "enabled": true,
+              "type": "Lifecycle",
+              "definition": {
+                "filters": {
+                  "blobTypes": [
+                    "blockBlob"
+                  ],
+                  "prefixMatch": [
+                    "landing/"
+                  ]
+                },
+                "actions": {
+                  "baseBlob": {
+                    "delete": {
+                      "daysAfterModificationGreaterThan": "[parameters('deleteLandingAfterDays')]"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "condition": "[parameters('deployPrivateEndpoints')]",
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2023-11-01",
+      "name": "[format('pep-{0}-{1}', parameters('storageAccountName'), variables('privateEndpointGroups')[copyIndex()])]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[variables('storageAccountId')]"
+      ],
+      "copy": {
+        "name": "privateEndpointLoop",
+        "count": "[length(variables('privateEndpointGroups'))]"
+      },
+      "properties": {
+        "subnet": {
+          "id": "[parameters('privateEndpointSubnetId')]"
+        },
+        "customNetworkInterfaceName": "[format('nic-pep-{0}-{1}', parameters('storageAccountName'), variables('privateEndpointGroups')[copyIndex()])]",
+        "privateLinkServiceConnections": [
+          {
+            "name": "[format('plsc-{0}-{1}', parameters('storageAccountName'), variables('privateEndpointGroups')[copyIndex()])]",
+            "properties": {
+              "privateLinkServiceId": "[variables('storageAccountId')]",
+              "groupIds": [
+                "[variables('privateEndpointGroups')[copyIndex()]]"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "condition": "[variables('deployDiagnostics')]",
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[format('Microsoft.Storage/storageAccounts/{0}/blobServices/default', parameters('storageAccountName'))]",
+      "name": "diag-to-log-analytics",
+      "dependsOn": [
+        "[variables('blobServiceId')]"
+      ],
+      "properties": {
+        "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+        "logs": [
+          {
+            "category": "StorageRead",
+            "enabled": true
+          },
+          {
+            "category": "StorageWrite",
+            "enabled": true
+          },
+          {
+            "category": "StorageDelete",
+            "enabled": true
+          }
+        ],
+        "metrics": [
+          {
+            "category": "Transaction",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "storageAccountId": {
+      "type": "string",
+      "value": "[variables('storageAccountId')]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "value": "[parameters('storageAccountName')]"
+    },
+    "dfsEndpoint": {
+      "type": "string",
+      "value": "[reference(variables('storageAccountId'), '2023-05-01').primaryEndpoints.dfs]"
+    },
+    "blobEndpoint": {
+      "type": "string",
+      "value": "[reference(variables('storageAccountId'), '2023-05-01').primaryEndpoints.blob]"
+    },
+    "containerNames": {
+      "type": "array",
+      "value": "[parameters('containerNames')]"
+    }
+  }
+}

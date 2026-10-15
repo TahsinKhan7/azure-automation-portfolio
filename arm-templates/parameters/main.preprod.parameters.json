@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "value": "preprod"
+    },
+    "platformName": {
+      "value": "dataplatform"
+    },
+    "orgPrefix": {
+      "value": "dp"
+    },
+    "location": {
+      "value": "uksouth"
+    },
+    "vnetAddressPrefix": {
+      "value": "10.20.0.0/16"
+    },
+    "databricksPublicSubnetPrefix": {
+      "value": "10.20.0.0/22"
+    },
+    "databricksPrivateSubnetPrefix": {
+      "value": "10.20.4.0/22"
+    },
+    "privateEndpointSubnetPrefix": {
+      "value": "10.20.8.0/24"
+    },
+    "storageSkuName": {
+      "value": "Standard_GZRS"
+    },
+    "storageContainerNames": {
+      "value": [
+        "landing",
+        "bronze",
+        "silver",
+        "gold"
+      ]
+    },
+    "coolTierAfterDays": {
+      "value": 30
+    },
+    "deleteLandingAfterDays": {
+      "value": 90
+    },
+    "logRetentionInDays": {
+      "value": 90
+    },
+    "logDailyQuotaGb": {
+      "value": 10
+    },
+    "keyVaultSkuName": {
+      "value": "standard"
+    },
+    "enableKeyVaultPurgeProtection": {
+      "value": true
+    },
+    "databricksPricingTier": {
+      "value": "premium"
+    },
+    "enableDataFactoryGit": {
+      "value": false
+    },
+    "dataFactoryGit": {
+      "value": {
+        "accountName": "",
+        "projectName": "",
+        "repositoryName": "",
+        "collaborationBranch": "main",
+        "rootFolder": "/adf"
+      }
+    },
+    "deployPrivateEndpoints": {
+      "value": true
+    },
+    "allowedIpRanges": {
+      "value": [
+        "203.0.113.0/24",
+        "198.51.100.42"
+      ]
+    },
+    "keyVaultSecretsUserPrincipalIds": {
+      "value": []
+    },
+    "servicePrincipalClientSecret": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dp-bootstrap-preprod-uks/providers/Microsoft.KeyVault/vaults/kv-dp-bootstrap-preprod"
+        },
+        "secretName": "dataplatform-sp-client-secret"
+      }
+    },
+    "tags": {
+      "value": {
+        "costCentre": "CC-4201",
+        "owner": "data-platform-engineering",
+        "dataClassification": "confidential",
+        "changeWindow": "Tue/Thu 18:00-21:00",
+        "repository": "azure-automation-portfolio"
+      }
+    }
+  }
+}
