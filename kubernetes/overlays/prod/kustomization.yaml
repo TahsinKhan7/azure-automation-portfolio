@@ -1,0 +1,69 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# prod overlay: only what differs from ../../base.
+namespace: dataplatform-prod
+
+resources:
+  - ../../base
+
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      environment: prod
+
+images:
+  - name: acrdataplatform.azurecr.io/dataplatform/data-api
+    newTag: 1.4.0
+
+patches:
+  - path: patch-configmap.yaml
+  - path: patch-deployment.yaml
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: data-api
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+  - target:
+      kind: PodDisruptionBudget
+      name: data-api
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2
+  - target:
+      kind: Ingress
+      name: data-api
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.dataplatform.example.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: api.dataplatform.example.com
+      - op: replace
+        path: /metadata/annotations/cert-manager.io~1cluster-issuer
+        value: letsencrypt-prod
+  - target:
+      kind: SecretProviderClass
+      name: data-api-keyvault
+    patch: |-
+      - op: replace
+        path: /spec/parameters/keyvaultName
+        value: kv-dp-data-prod-01
+      - op: replace
+        path: /spec/parameters/clientID
+        value: 00000000-0000-0000-0000-00000000d005
+  - target:
+      kind: ServiceAccount
+      name: data-api
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/azure.workload.identity~1client-id
+        value: 00000000-0000-0000-0000-00000000d005

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-api-config
+data:
+  ENVIRONMENT: preprod
+  LOG_LEVEL: INFO
+  KEY_VAULT_NAME: kv-dp-data-preprod-01
+  STORAGE_ACCOUNT: stdpdatapreprod01
+  UNITY_CATALOG: dp_data_preprod
+  DATABRICKS_HOST: https://adb-0000000000000000.0.azuredatabricks.net

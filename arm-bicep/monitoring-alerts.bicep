@@ -46,7 +46,42 @@ resource adfFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-prev
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
-          failingPeriods: { numberOfEvaluationPeriods: 1; minFailingPeriodsToAlert: 1 }
+          failingPeriods: { numberOfEvaluationPeriods: 1, minFailingPeriodsToAlert: 1 }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [actionGroupId]
+    }
+  }
+  tags: tags
+}
+
+// --- Databricks Job Failure Alert ---
+resource databricksJobFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (!empty(databricksWorkspaceId)) {
+  name: '${alertPrefix}-databricks-job-failure'
+  location: location
+  properties: {
+    displayName: 'Databricks Job Failure'
+    description: 'Fires when a Databricks job run finishes with a failed result state'
+    severity: 1
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    scopes: [logAnalyticsWorkspaceId]
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            DatabricksJobs
+            | where ActionName == "runFailed"
+            | where _ResourceId =~ "${databricksWorkspaceId}"
+            | summarize FailureCount = count() by JobName = tostring(parse_json(RequestParams).jobName)
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: { numberOfEvaluationPeriods: 1, minFailingPeriodsToAlert: 1 }
         }
       ]
     }
@@ -84,7 +119,7 @@ resource errorRateAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previ
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
-          failingPeriods: { numberOfEvaluationPeriods: 1; minFailingPeriodsToAlert: 1 }
+          failingPeriods: { numberOfEvaluationPeriods: 1, minFailingPeriodsToAlert: 1 }
         }
       ]
     }
@@ -120,7 +155,7 @@ resource kvAccessAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previe
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
-          failingPeriods: { numberOfEvaluationPeriods: 1; minFailingPeriodsToAlert: 1 }
+          failingPeriods: { numberOfEvaluationPeriods: 1, minFailingPeriodsToAlert: 1 }
         }
       ]
     }
@@ -155,7 +190,7 @@ resource storageThrottleAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
-          failingPeriods: { numberOfEvaluationPeriods: 1; minFailingPeriodsToAlert: 1 }
+          failingPeriods: { numberOfEvaluationPeriods: 1, minFailingPeriodsToAlert: 1 }
         }
       ]
     }

@@ -1,118 +1,89 @@
 <#
 .SYNOPSIS
-    Generates Azure cost breakdown reports by subscription, resource group and resource type.
+    Generates Azure cost breakdown reports by subscription, resource group and resource.
 
 .DESCRIPTION
-    Queries Azure Cost Management APIs to produce a spend summary for the current and
-    previous billing periods. Highlights top cost drivers and month-over-month changes
-    to support FinOps reviews and cost optimisation efforts.
+    Queries Cost Management usage detail for the current and previous billing
+    periods, aggregates it with the DataPlatform.Automation module and writes
+    detail and summary CSVs. Highlights the top cost drivers for FinOps reviews.
 
-.PARAMETER SubscriptionIds
-    Array of subscription IDs to report on. Default: current subscription.
+.PARAMETER SubscriptionId
+    Subscription IDs to report on. Defaults to the current context subscription.
 
 .PARAMETER BillingPeriodMonths
-    Number of months to include. Default: 2 (current + previous).
+    Number of months to include, counting back from the current month.
 
 .PARAMETER OutputPath
-    Path for report output.
+    Folder for the CSV output.
 
 .EXAMPLE
-    .\Get-AzureCostReport.ps1 -SubscriptionIds @("sub-id-1","sub-id-2") -OutputPath ".\reports\"
+    ./Get-AzureCostReport.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000 -OutputPath ./reports
 #>
-
+#Requires -Version 7.0
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $false)]
-    [string[]]$SubscriptionIds,
+    [string[]]$SubscriptionId,
 
-    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 12)]
     [int]$BillingPeriodMonths = 2,
 
-    [Parameter(Mandatory = $false)]
-    [string]$OutputPath = ".\reports"
+    [string]$OutputPath = './reports'
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== Azure Cost Report ===" -ForegroundColor Cyan
+Write-DpLog -Message 'Azure cost report'
 
-if (-not (Test-Path $OutputPath)) {
+if (-not (Test-Path -Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
 
-# Default to current subscription if none specified
-if (-not $SubscriptionIds) {
-    $SubscriptionIds = @((Get-AzContext).Subscription.Id)
+if (-not $SubscriptionId) {
+    $SubscriptionId = @((Get-AzContext).Subscription.Id)
 }
 
-$allCosts = @()
+$allCosts = [System.Collections.Generic.List[object]]::new()
 
-foreach ($subId in $SubscriptionIds) {
-    Write-Host "`nSubscription: $subId" -ForegroundColor Cyan
-    Set-AzContext -SubscriptionId $subId | Out-Null
+foreach ($id in $SubscriptionId) {
+    Set-AzContext -SubscriptionId $id | Out-Null
+    $subscriptionName = (Get-AzSubscription -SubscriptionId $id).Name
+    Write-DpLog -Message "Subscription: $subscriptionName"
 
-    $subName = (Get-AzSubscription -SubscriptionId $subId).Name
-
-    # Query cost data for each month
     for ($i = 0; $i -lt $BillingPeriodMonths; $i++) {
-        $startDate = (Get-Date).AddMonths(-$i).ToString("yyyy-MM-01")
-        $endDate = (Get-Date $startDate).AddMonths(1).AddDays(-1).ToString("yyyy-MM-dd")
-        $monthLabel = (Get-Date $startDate).ToString("yyyy-MM")
-
-        Write-Host "  Querying: $monthLabel" -ForegroundColor DarkGray
+        $monthStart = (Get-Date -Day 1).Date.AddMonths(-$i)
+        $monthEnd = $monthStart.AddMonths(1).AddDays(-1)
+        $monthLabel = $monthStart.ToString('yyyy-MM')
+        Write-DpLog -Message "  Querying $monthLabel" -Level Debug
 
         try {
-            $costs = Get-AzConsumptionUsageDetail -StartDate $startDate -EndDate $endDate `
-                        -ErrorAction SilentlyContinue
-
-            if ($costs) {
-                $grouped = $costs | Group-Object -Property InstanceName | ForEach-Object {
-                    [PSCustomObject]@{
-                        Subscription   = $subName
-                        Month          = $monthLabel
-                        ResourceGroup  = ($_.Group[0].InstanceId -split '/')[4]
-                        ResourceName   = $_.Name
-                        ResourceType   = $_.Group[0].ConsumedService
-                        TotalCost      = [math]::Round(($_.Group | Measure-Object -Property PretaxCost -Sum).Sum, 2)
-                        Currency       = $_.Group[0].Currency
-                    }
-                }
-                $allCosts += $grouped
+            $usage = @(Get-AzConsumptionUsageDetail -StartDate $monthStart -EndDate $monthEnd)
+            if ($usage.Count -gt 0) {
+                $allCosts.AddRange([object[]](ConvertTo-DpCostSummary -UsageDetail $usage -SubscriptionName $subscriptionName -Month $monthLabel))
             }
-        }
-        catch {
-            Write-Warning "  Failed to query costs for $monthLabel : $_"
+        } catch {
+            Write-DpLog -Message "Failed to query costs for $monthLabel in $subscriptionName : $($_.Exception.Message)" -Level Warning
         }
     }
 }
 
-# Generate summary by resource group
-$rgSummary = $allCosts | Group-Object Subscription, Month, ResourceGroup | ForEach-Object {
-    [PSCustomObject]@{
-        Subscription  = ($_.Group[0].Subscription)
-        Month         = ($_.Group[0].Month)
-        ResourceGroup = ($_.Group[0].ResourceGroup)
-        TotalSpend    = [math]::Round(($_.Group | Measure-Object -Property TotalCost -Sum).Sum, 2)
-        ResourceCount = $_.Count
-    }
-} | Sort-Object -Property TotalSpend -Descending
+$resourceGroupSummary = Get-DpCostSummaryByResourceGroup -CostRow $allCosts
+$topDrivers = Get-DpTopCostDriver -CostRow $allCosts -Top 10
 
-# Export detailed report
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$detailFile = Join-Path $OutputPath "cost-detail-$timestamp.csv"
-$summaryFile = Join-Path $OutputPath "cost-summary-$timestamp.csv"
-
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$detailFile = Join-Path -Path $OutputPath -ChildPath "cost-detail-$timestamp.csv"
+$summaryFile = Join-Path -Path $OutputPath -ChildPath "cost-summary-$timestamp.csv"
 $allCosts | Export-Csv -Path $detailFile -NoTypeInformation
-$rgSummary | Export-Csv -Path $summaryFile -NoTypeInformation
+$resourceGroupSummary | Export-Csv -Path $summaryFile -NoTypeInformation
 
-# Print top cost drivers
-Write-Host "`n=== Top 10 Cost Drivers ===" -ForegroundColor Cyan
-$allCosts | Sort-Object TotalCost -Descending | Select-Object -First 10 |
-    Format-Table Subscription, Month, ResourceGroup, ResourceName, TotalCost, Currency -AutoSize
+Write-DpLog -Message 'Top 10 cost drivers'
+$topDrivers | Format-Table -Property Subscription, Month, ResourceGroup, ResourceName, TotalCost, Currency -AutoSize | Out-String | Write-DpLog
 
-Write-Host "`n=== Monthly Spend by Resource Group ===" -ForegroundColor Cyan
-$rgSummary | Select-Object -First 15 |
-    Format-Table Subscription, Month, ResourceGroup, TotalSpend, ResourceCount -AutoSize
+Write-DpLog -Message "Detailed report: $detailFile" -Level Success
+Write-DpLog -Message "Summary report:  $summaryFile" -Level Success
 
-Write-Host "Detailed report: $detailFile" -ForegroundColor Green
-Write-Host "Summary report:  $summaryFile" -ForegroundColor Green
+[pscustomobject]@{
+    DetailFile  = $detailFile
+    SummaryFile = $summaryFile
+    Rows        = $allCosts.Count
+}

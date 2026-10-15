@@ -1,0 +1,89 @@
+// ============================================================================
+// Databricks cluster events
+//
+// Purpose : Cost and governance view of cluster lifecycle activity: who is
+//           creating clusters, whether they use an approved policy, how long
+//           interactive clusters live, and which starts fail.
+// Source  : DatabricksClusters (resource-specific table populated by the
+//           "clusters" diagnostic category on the Databricks workspace;
+//           enabled by the databricks-workspace Terraform module).
+// Schema  : TimeGenerated, ActionName (create|start|resize|terminate|delete|
+//           edit ...), Identity (dynamic: email), RequestParams (dynamic:
+//           cluster_name, cluster_id, policy_id, node_type_id, num_workers,
+//           autoscale, autotermination_minutes, custom_tags),
+//           Response (dynamic: statusCode, errorMessage), Workspace,
+//           _ResourceId.
+// Usage   : Workbook tiles and a weekly governance report. Sections 2 and 4
+//           are suitable for scheduled query alerts.
+// ============================================================================
+
+// --- 1. Cluster lifecycle volume per day and action ------------------------
+DatabricksClusters
+| where TimeGenerated > ago(30d)
+| where ActionName in ("create", "start", "resize", "terminate", "delete")
+| summarize Events = count() by ActionName, bin(TimeGenerated, 1d)
+| order by TimeGenerated desc, ActionName asc
+
+// --- 2. Clusters created without a cluster policy ---------------------------
+// Every policy in terraform/modules/databricks-cluster-policies forces cost
+// tags and auto-termination; a create without policy_id bypasses all of it.
+DatabricksClusters
+| where TimeGenerated > ago(7d)
+| where ActionName == "create"
+| extend Params = parse_json(RequestParams)
+| extend
+    CreatedBy   = tostring(parse_json(Identity).email),
+    ClusterName = tostring(Params.cluster_name),
+    PolicyId    = tostring(Params.policy_id),
+    NodeType    = tostring(Params.node_type_id),
+    Workers     = coalesce(toint(Params.num_workers), toint(Params.autoscale.max_workers)),
+    AutoTermMin = toint(Params.autotermination_minutes)
+| where isempty(PolicyId)
+| project TimeGenerated, CreatedBy, ClusterName, NodeType, Workers, AutoTermMin, Workspace = _ResourceId
+| order by TimeGenerated desc
+
+// --- 3. Interactive clusters running longer than 8 hours --------------------
+// Pairs the latest start with the latest terminate per cluster. A start with
+// no later terminate is still running; the duration is measured to now().
+DatabricksClusters
+| where TimeGenerated > ago(14d)
+| where ActionName in ("start", "create", "terminate", "delete")
+| extend ClusterId = tostring(coalesce(parse_json(RequestParams).cluster_id, parse_json(Response).result))
+| where isnotempty(ClusterId)
+| extend Actor = tostring(parse_json(Identity).email)
+| summarize
+    LastStart = maxif(TimeGenerated, ActionName in ("start", "create")),
+    LastStop  = maxif(TimeGenerated, ActionName in ("terminate", "delete")),
+    (LastEventTime, LastActor) = arg_max(TimeGenerated, Actor)
+    by ClusterId
+| extend RunningHours = round(datetime_diff('minute', coalesce(LastStop, now()), LastStart) / 60.0, 1)
+| where isnotnull(LastStart) and (isnull(LastStop) or LastStop < LastStart) and RunningHours > 8
+| project ClusterId, LastActor, LastStart, RunningHours
+| order by RunningHours desc
+
+// --- 4. Failed cluster starts and the reason ---------------------------------
+DatabricksClusters
+| where TimeGenerated > ago(24h)
+| where ActionName in ("start", "create", "resize")
+| extend Resp = parse_json(Response)
+| where toint(Resp.statusCode) >= 400
+| project
+    TimeGenerated,
+    ActionName,
+    User        = tostring(parse_json(Identity).email),
+    ClusterName = tostring(parse_json(RequestParams).cluster_name),
+    StatusCode  = toint(Resp.statusCode),
+    Error       = substring(tostring(Resp.errorMessage), 0, 200)
+| order by TimeGenerated desc
+
+// --- 5. Top cluster creators by node type (chargeback input) ----------------
+DatabricksClusters
+| where TimeGenerated > ago(30d)
+| where ActionName == "create"
+| extend Params = parse_json(RequestParams)
+| summarize
+    Clusters   = count(),
+    NodeTypes  = make_set(tostring(Params.node_type_id), 10),
+    CostCentre = any(tostring(Params.custom_tags.CostCentre))
+    by User = tostring(parse_json(Identity).email)
+| top 20 by Clusters desc

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-api-config
+data:
+  ENVIRONMENT: iqe
+  LOG_LEVEL: INFO
+  KEY_VAULT_NAME: kv-dp-data-iqe-01
+  STORAGE_ACCOUNT: stdpdataiqe01
+  UNITY_CATALOG: dp_data_iqe
+  DATABRICKS_HOST: https://adb-0000000000000000.0.azuredatabricks.net

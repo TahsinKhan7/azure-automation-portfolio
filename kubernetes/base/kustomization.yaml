@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Environment-neutral definition of the data API. Overlays set the namespace,
+# image tag, replica bounds, resources, hostnames and Key Vault identity.
+namespace: dataplatform
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: data-api
+      app.kubernetes.io/part-of: dataplatform
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/component: api
+      app.kubernetes.io/managed-by: kustomize
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - secretproviderclass.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+  - servicemonitor.yaml

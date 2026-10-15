@@ -1,0 +1,87 @@
+// ============================================================================
+// Data Factory pipeline run duration trends
+//
+// Purpose : Spot pipelines that are getting slower before they start missing
+//           their SLA, and quantify day-to-day variance per pipeline.
+// Source  : ADFPipelineRun (resource-specific table from the "PipelineRuns"
+//           diagnostic category, "Dedicated" destination type as configured
+//           by the data-factory Terraform module).
+// Schema  : TimeGenerated, PipelineName, RunId, Status (Succeeded|Failed|
+//           Cancelled|InProgress), Start, End, Parameters (dynamic),
+//           Annotations, _ResourceId.
+// Notes   : Each run emits several rows (InProgress then terminal); the
+//           queries keep the terminal row per RunId using arg_max.
+// ============================================================================
+
+// Shared: one row per completed run with its duration in minutes.
+let CompletedRuns = () {
+    ADFPipelineRun
+    | where TimeGenerated > ago(30d)
+    | where Status in ("Succeeded", "Failed")
+    | summarize arg_max(TimeGenerated, *) by RunId
+    | extend DurationMin = round(datetime_diff('second', End, Start) / 60.0, 2)
+    | where DurationMin >= 0
+    | project RunId, PipelineName, Status, Start, End, DurationMin, Factory = tostring(split(_ResourceId, "/")[-1])
+};
+
+// --- 1. Daily duration percentiles per pipeline -----------------------------
+CompletedRuns()
+| summarize
+    Runs = count(),
+    P50  = percentile(DurationMin, 50),
+    P95  = percentile(DurationMin, 95),
+    Max  = max(DurationMin)
+    by PipelineName, Day = bin(Start, 1d)
+| order by PipelineName asc, Day desc
+
+// --- 2. Pipelines slower this week than their 3-week baseline ---------------
+// Flags a pipeline when this week's median exceeds the prior baseline by 25%
+// or more and by at least 5 minutes, so tiny pipelines do not create noise.
+let Baseline =
+    CompletedRuns()
+    | where Status == "Succeeded" and Start between (ago(28d) .. ago(7d))
+    | summarize BaselineP50 = percentile(DurationMin, 50), BaselineRuns = count() by PipelineName;
+let ThisWeek =
+    CompletedRuns()
+    | where Status == "Succeeded" and Start > ago(7d)
+    | summarize CurrentP50 = percentile(DurationMin, 50), CurrentRuns = count() by PipelineName;
+ThisWeek
+| join kind=inner Baseline on PipelineName
+| extend ChangePct = round((CurrentP50 - BaselineP50) / BaselineP50 * 100, 1)
+| where BaselineRuns >= 5 and ChangePct >= 25 and (CurrentP50 - BaselineP50) >= 5
+| project PipelineName, BaselineP50, CurrentP50, ChangePct, BaselineRuns, CurrentRuns
+| order by ChangePct desc
+
+// --- 3. 30-day trend line per pipeline (for a workbook time chart) ----------
+CompletedRuns()
+| where Status == "Succeeded"
+| make-series MedianDurationMin = percentile(DurationMin, 50) default = real(null)
+    on Start from ago(30d) to now() step 1d
+    by PipelineName
+| extend (Slope, _, _, _, _) = series_fit_line(MedianDurationMin)
+| extend TrendMinPerDay = round(Slope, 3)
+| project PipelineName, TrendMinPerDay, MedianDurationMin, Start
+| order by TrendMinPerDay desc
+
+// --- 4. Runs that breached their SLA ---------------------------------------
+// SLA minutes per pipeline are held in a datatable so that the threshold is
+// version-controlled with the query; replace with a watchlist if preferred.
+let Sla = datatable(PipelineName: string, SlaMin: real) [
+    "pl_bronze_ingest_daily", 45,
+    "pl_silver_transform",    90,
+    "pl_gold_publish",        30
+];
+CompletedRuns()
+| where Start > ago(7d)
+| join kind=inner Sla on PipelineName
+| where DurationMin > SlaMin
+| project Start, PipelineName, Status, DurationMin, SlaMin, OverBy = round(DurationMin - SlaMin, 1), RunId
+| order by OverBy desc
+
+// --- 5. Duration variance: least predictable pipelines ----------------------
+CompletedRuns()
+| where Status == "Succeeded"
+| summarize Runs = count(), Mean = avg(DurationMin), StdDev = stdev(DurationMin) by PipelineName
+| where Runs >= 10
+| extend CoefficientOfVariation = round(StdDev / Mean, 2)
+| order by CoefficientOfVariation desc

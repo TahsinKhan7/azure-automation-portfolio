@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-api
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: 20m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.dev.dataplatform.example.com
+      secretName: data-api-tls
+  rules:
+    - host: api.dev.dataplatform.example.com
+      http:
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: data-api
+                port:
+                  name: http
+          - path: /health/live
+            pathType: Exact
+            backend:
+              service:
+                name: data-api
+                port:
+                  name: http
