@@ -1,0 +1,19 @@
+dataset: policies_silver
+description: Conformed policies; one row per policy_number with valid dates and premiums.
+expectations:
+  - type: not_null
+    columns: [policy_number, customer_id, start_date]
+  - type: unique
+    columns: [policy_number]
+  - type: accepted_values
+    column: status
+    values: [active, lapsed, cancelled, expired]
+  - type: value_range
+    column: annual_premium
+    min: 0
+    max: 250000
+  - type: regex
+    column: policy_number
+    pattern: "^POL-[0-9]{6}$"
+  - type: row_count
+    min: 1

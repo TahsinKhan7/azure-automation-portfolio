@@ -1,110 +1,89 @@
 <#
 .SYNOPSIS
-    Creates standardised Azure resource groups with mandatory tagging and policy assignments.
+    Creates a standardised resource group with mandatory tags, an optional lock and tag policy.
 
 .DESCRIPTION
-    Provisions resource groups following enterprise naming conventions and applies
-    required tags (cost centre, environment, owner, project). Optionally assigns
-    Azure Policy initiatives for governance compliance.
-
-.PARAMETER Environment
-    Target environment: dev, staging, prod.
-
-.PARAMETER BusinessUnit
-    Business unit code (e.g. insurance, health, uk).
-
-.PARAMETER ProjectName
-    Short project identifier for naming and tagging.
-
-.PARAMETER Location
-    Azure region. Default: uksouth.
+    Derives the resource group name from the platform naming convention
+    (Get-DpResourceName), validates the tag set (Test-DpTagCompliance), then
+    creates or updates the group. Production-like environments receive a
+    CanNotDelete lock. Idempotent: re-running updates tags only.
 
 .EXAMPLE
-    .\New-AzureResourceGroup.ps1 -Environment prod -BusinessUnit insurance -ProjectName "databricks-etl"
+    ./New-AzureResourceGroup.ps1 -Environment prod -Workload data -CostCentre CC-DATA-PROD -OwnerEmail team@example.com
 #>
-
-[CmdletBinding()]
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("dev", "staging", "prod")]
+    [Parameter(Mandatory)]
+    [ValidateSet('dev', 'ite', 'iqe', 'preprod', 'prod')]
     [string]$Environment,
 
-    [Parameter(Mandatory = $true)]
-    [string]$BusinessUnit,
+    [ValidatePattern('^[a-z0-9]{2,10}$')]
+    [string]$Workload = 'data',
 
-    [Parameter(Mandatory = $true)]
-    [string]$ProjectName,
+    [string]$Location = 'uksouth',
 
-    [Parameter(Mandatory = $false)]
-    [string]$Location = "uksouth",
+    [Parameter(Mandatory)]
+    [ValidatePattern('^CC-[A-Z0-9-]+$')]
+    [string]$CostCentre,
 
-    [Parameter(Mandatory = $false)]
-    [string]$CostCentre = "CC-DEFAULT",
+    [string]$OwnerEmail,
 
-    [Parameter(Mandatory = $false)]
-    [string]$OwnerEmail
+    [string]$Prefix = 'dp',
+
+    [switch]$AssignTagPolicy
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-# Naming convention: rg-{businessunit}-{project}-{environment}
-$rgName = "rg-$BusinessUnit-$ProjectName-$Environment".ToLower()
+$name = Get-DpResourceName -ResourceType ResourceGroup -Environment $Environment -Workload $Workload -Location $Location -Prefix $Prefix
 
 $tags = @{
-    Environment  = $Environment
-    BusinessUnit = $BusinessUnit
-    Project      = $ProjectName
-    CostCentre   = $CostCentre
-    Owner        = if ($OwnerEmail) { $OwnerEmail } else { (Get-AzContext).Account.Id }
-    CreatedBy    = "Automation"
-    CreatedDate  = (Get-Date -Format "yyyy-MM-dd")
+    Environment = $Environment
+    Workload    = $Workload
+    CostCentre  = $CostCentre
+    Owner       = if ($OwnerEmail) { $OwnerEmail } else { (Get-AzContext).Account.Id }
+    Platform    = 'dataplatform'
+    ManagedBy   = 'powershell'
 }
 
-Write-Host "`n=== Resource Group Provisioning ===" -ForegroundColor Cyan
-Write-Host "Name:         $rgName"
-Write-Host "Location:     $Location"
-Write-Host "Environment:  $Environment"
-Write-Host "Business Unit: $BusinessUnit"
-Write-Host "Tags:"
-$tags.GetEnumerator() | ForEach-Object { Write-Host "  $($_.Key): $($_.Value)" }
+$compliance = Test-DpTagCompliance -Tags $tags
+if (-not $compliance.IsCompliant) {
+    throw "Tag set is not compliant. Missing: $($compliance.MissingTags -join ', '). Invalid: $(($compliance.InvalidTags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')"
+}
 
-# Check if resource group already exists
-$existing = Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue
+Write-DpLog -Message "Resource group: $name ($Location)"
+
+$existing = Get-AzResourceGroup -Name $name -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "`nResource group '$rgName' already exists. Updating tags..." -ForegroundColor Yellow
-    Set-AzResourceGroup -Name $rgName -Tag $tags | Out-Null
-    Write-Host "Tags updated." -ForegroundColor Green
-}
-else {
-    Write-Host "`nCreating resource group..." -ForegroundColor Yellow
-    New-AzResourceGroup -Name $rgName -Location $Location -Tag $tags | Out-Null
-    Write-Host "Resource group '$rgName' created." -ForegroundColor Green
-}
-
-# Apply resource lock for production
-if ($Environment -eq "prod") {
-    Write-Host "Applying CanNotDelete lock for production..." -ForegroundColor Yellow
-    New-AzResourceLock -LockName "DoNotDelete" -LockLevel CanNotDelete `
-                        -ResourceGroupName $rgName -Force | Out-Null
-    Write-Host "Lock applied." -ForegroundColor Green
+    if ($PSCmdlet.ShouldProcess($name, 'Update tags')) {
+        Set-AzResourceGroup -Name $name -Tag $tags | Out-Null
+        Write-DpLog -Message 'Existing group found; tags updated.' -Level Success
+    }
+} elseif ($PSCmdlet.ShouldProcess($name, 'Create resource group')) {
+    New-AzResourceGroup -Name $name -Location $Location -Tag $tags | Out-Null
+    Write-DpLog -Message 'Resource group created.' -Level Success
 }
 
-# Assign built-in Azure Policy for tag governance
-$policyDefinition = Get-AzPolicyDefinition | Where-Object {
-    $_.Properties.DisplayName -eq "Require a tag on resource groups"
-} | Select-Object -First 1
-
-if ($policyDefinition) {
-    $rgScope = (Get-AzResourceGroup -Name $rgName).ResourceId
-    $params = @{ tagName = @{ value = "CostCentre" } }
-
-    New-AzPolicyAssignment -Name "require-costcentre-tag" `
-                            -DisplayName "Require CostCentre tag" `
-                            -PolicyDefinition $policyDefinition `
-                            -Scope $rgScope `
-                            -PolicyParameterObject $params `
-                            -ErrorAction SilentlyContinue | Out-Null
-    Write-Host "Policy assignment applied: Require CostCentre tag" -ForegroundColor Green
+if ($Environment -in @('preprod', 'prod') -and $PSCmdlet.ShouldProcess($name, 'Apply CanNotDelete lock')) {
+    New-AzResourceLock -LockName "lock-$name" -LockLevel CanNotDelete -ResourceGroupName $name -Force | Out-Null
+    Write-DpLog -Message 'CanNotDelete lock applied.' -Level Success
 }
 
-Write-Host "`nDone. Resource group '$rgName' is ready.`n" -ForegroundColor Cyan
+if ($AssignTagPolicy) {
+    $definition = Get-AzPolicyDefinition | Where-Object { $_.Properties.DisplayName -eq 'Require a tag on resources' } | Select-Object -First 1
+    $scope = (Get-AzResourceGroup -Name $name).ResourceId
+
+    if ($definition -and $PSCmdlet.ShouldProcess($scope, 'Assign policy: require CostCentre tag')) {
+        New-AzPolicyAssignment -Name 'require-costcentre-tag' -DisplayName 'Require CostCentre tag' -PolicyDefinition $definition `
+            -Scope $scope -PolicyParameterObject @{ tagName = 'CostCentre' } | Out-Null
+        Write-DpLog -Message 'Policy assignment applied.' -Level Success
+    }
+}
+
+[pscustomobject]@{
+    Name     = $name
+    Location = $Location
+    Tags     = $tags
+}

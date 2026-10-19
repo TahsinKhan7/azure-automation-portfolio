@@ -1,0 +1,289 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Network foundation for the data platform: virtual network, Databricks host/container subnets with delegation and the NSG rules Databricks requires, plus a dedicated private endpoint subnet.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "vnetName": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Name of the virtual network."
+      }
+    },
+    "nsgName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "metadata": {
+        "description": "Name of the network security group attached to both Databricks subnets."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for all network resources."
+      }
+    },
+    "addressPrefix": {
+      "type": "string",
+      "metadata": {
+        "description": "Address space of the virtual network in CIDR notation, e.g. 10.10.0.0/16."
+      }
+    },
+    "databricksPublicSubnetPrefix": {
+      "type": "string",
+      "metadata": {
+        "description": "CIDR for the Databricks host (public) subnet. Must sit inside addressPrefix."
+      }
+    },
+    "databricksPrivateSubnetPrefix": {
+      "type": "string",
+      "metadata": {
+        "description": "CIDR for the Databricks container (private) subnet. Must sit inside addressPrefix."
+      }
+    },
+    "privateEndpointSubnetPrefix": {
+      "type": "string",
+      "metadata": {
+        "description": "CIDR for the subnet that hosts private endpoints for storage, Key Vault and other PaaS services."
+      }
+    },
+    "databricksPublicSubnetName": {
+      "type": "string",
+      "defaultValue": "snet-databricks-host",
+      "metadata": {
+        "description": "Name of the Databricks host subnet."
+      }
+    },
+    "databricksPrivateSubnetName": {
+      "type": "string",
+      "defaultValue": "snet-databricks-container",
+      "metadata": {
+        "description": "Name of the Databricks container subnet."
+      }
+    },
+    "privateEndpointSubnetName": {
+      "type": "string",
+      "defaultValue": "snet-private-endpoints",
+      "metadata": {
+        "description": "Name of the private endpoint subnet."
+      }
+    },
+    "enableDdosProtection": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Enable DDoS Network Protection on the virtual network. Normally only true where a DDoS plan exists at the hub."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to every resource in this module."
+      }
+    }
+  },
+  "variables": {
+    "databricksDelegation": [
+      {
+        "name": "databricks-delegation",
+        "properties": {
+          "serviceName": "Microsoft.Databricks/workspaces"
+        }
+      }
+    ],
+    "serviceEndpoints": [
+      {
+        "service": "Microsoft.Storage"
+      },
+      {
+        "service": "Microsoft.KeyVault"
+      }
+    ],
+    "subnets": [
+      {
+        "name": "[parameters('databricksPublicSubnetName')]",
+        "prefix": "[parameters('databricksPublicSubnetPrefix')]",
+        "isDatabricks": true
+      },
+      {
+        "name": "[parameters('databricksPrivateSubnetName')]",
+        "prefix": "[parameters('databricksPrivateSubnetPrefix')]",
+        "isDatabricks": true
+      },
+      {
+        "name": "[parameters('privateEndpointSubnetName')]",
+        "prefix": "[parameters('privateEndpointSubnetPrefix')]",
+        "isDatabricks": false
+      }
+    ],
+    "nsgId": "[resourceId('Microsoft.Network/networkSecurityGroups', parameters('nsgName'))]",
+    "securityRules": [
+      {
+        "name": "AllowDatabricksWorkerToWorkerInbound",
+        "priority": 100,
+        "direction": "Inbound",
+        "access": "Allow",
+        "protocol": "*",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "VirtualNetwork",
+        "destinationPortRange": "*",
+        "description": "Required by Databricks for worker node communication inside the subnets."
+      },
+      {
+        "name": "AllowDatabricksWorkerToWorkerOutbound",
+        "priority": 100,
+        "direction": "Outbound",
+        "access": "Allow",
+        "protocol": "*",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "VirtualNetwork",
+        "destinationPortRange": "*",
+        "description": "Required by Databricks for worker node communication inside the subnets."
+      },
+      {
+        "name": "AllowDatabricksControlPlaneOutbound",
+        "priority": 110,
+        "direction": "Outbound",
+        "access": "Allow",
+        "protocol": "Tcp",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "AzureDatabricks",
+        "destinationPortRange": "443",
+        "description": "Workers to the Databricks control plane, secure cluster connectivity relay and webapp."
+      },
+      {
+        "name": "AllowDatabricksSqlOutbound",
+        "priority": 120,
+        "direction": "Outbound",
+        "access": "Allow",
+        "protocol": "Tcp",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "Sql",
+        "destinationPortRange": "3306",
+        "description": "Workers to the Databricks managed Hive metastore."
+      },
+      {
+        "name": "AllowDatabricksStorageOutbound",
+        "priority": 130,
+        "direction": "Outbound",
+        "access": "Allow",
+        "protocol": "Tcp",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "Storage",
+        "destinationPortRange": "443",
+        "description": "Workers to Azure Storage (DBFS root and data lake)."
+      },
+      {
+        "name": "AllowDatabricksEventHubOutbound",
+        "priority": 140,
+        "direction": "Outbound",
+        "access": "Allow",
+        "protocol": "Tcp",
+        "sourceAddressPrefix": "VirtualNetwork",
+        "destinationAddressPrefix": "EventHub",
+        "destinationPortRange": "9093",
+        "description": "Workers to Azure Event Hubs for Databricks log and telemetry shipping."
+      }
+    ]
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2025-05-01",
+      "name": "[parameters('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "copy": [
+          {
+            "name": "securityRules",
+            "count": "[length(variables('securityRules'))]",
+            "input": {
+              "name": "[variables('securityRules')[copyIndex('securityRules')].name]",
+              "properties": {
+                "description": "[variables('securityRules')[copyIndex('securityRules')].description]",
+                "priority": "[variables('securityRules')[copyIndex('securityRules')].priority]",
+                "direction": "[variables('securityRules')[copyIndex('securityRules')].direction]",
+                "access": "[variables('securityRules')[copyIndex('securityRules')].access]",
+                "protocol": "[variables('securityRules')[copyIndex('securityRules')].protocol]",
+                "sourceAddressPrefix": "[variables('securityRules')[copyIndex('securityRules')].sourceAddressPrefix]",
+                "sourcePortRange": "*",
+                "destinationAddressPrefix": "[variables('securityRules')[copyIndex('securityRules')].destinationAddressPrefix]",
+                "destinationPortRange": "[variables('securityRules')[copyIndex('securityRules')].destinationPortRange]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2025-05-01",
+      "name": "[parameters('vnetName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[variables('nsgId')]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('addressPrefix')]"
+          ]
+        },
+        "enableDdosProtection": "[parameters('enableDdosProtection')]",
+        "copy": [
+          {
+            "name": "subnets",
+            "count": "[length(variables('subnets'))]",
+            "input": {
+              "name": "[variables('subnets')[copyIndex('subnets')].name]",
+              "properties": {
+                "addressPrefix": "[variables('subnets')[copyIndex('subnets')].prefix]",
+                "networkSecurityGroup": {
+                  "id": "[variables('nsgId')]"
+                },
+                "serviceEndpoints": "[variables('serviceEndpoints')]",
+                "delegations": "[if(variables('subnets')[copyIndex('subnets')].isDatabricks, variables('databricksDelegation'), json('[]'))]",
+                "privateEndpointNetworkPolicies": "[if(variables('subnets')[copyIndex('subnets')].isDatabricks, 'Enabled', 'Disabled')]",
+                "privateLinkServiceNetworkPolicies": "Enabled"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "vnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+    },
+    "vnetName": {
+      "type": "string",
+      "value": "[parameters('vnetName')]"
+    },
+    "nsgId": {
+      "type": "string",
+      "value": "[variables('nsgId')]"
+    },
+    "databricksPublicSubnetName": {
+      "type": "string",
+      "value": "[parameters('databricksPublicSubnetName')]"
+    },
+    "databricksPrivateSubnetName": {
+      "type": "string",
+      "value": "[parameters('databricksPrivateSubnetName')]"
+    },
+    "privateEndpointSubnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks/subnets', parameters('vnetName'), parameters('privateEndpointSubnetName'))]"
+    }
+  }
+}

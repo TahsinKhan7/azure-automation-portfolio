@@ -1,0 +1,10 @@
+# markdownlint-cli2 configuration (relaxed: long tables and inline HTML are
+# normal in a portfolio README).
+default: true
+MD013: false   # line length
+MD033: false   # inline HTML (badges, <details>)
+MD041: false   # first line must be a top-level heading
+MD024:
+  siblings_only: true
+MD026:
+  punctuation: ".,;:!"

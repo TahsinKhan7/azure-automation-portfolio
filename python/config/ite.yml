@@ -1,0 +1,29 @@
+# dataplatform configuration: ite
+# Non-secret settings only. Secrets (tokens, connection strings) come from Key Vault
+# via the Databricks secret scope or DefaultAzureCredential at runtime.
+environment: ite
+workspace_host: https://adb-0000000000000000.0.azuredatabricks.net
+key_vault_name: kv-dataplatform-ite
+catalog: dataplatform_ite
+
+storage:
+  account_name: stdataplatformite
+  containers:
+    landing: landing
+    bronze: bronze
+    silver: silver
+    gold: gold
+    quarantine: quarantine
+    checkpoints: checkpoints
+
+job:
+  shuffle_partitions: 32
+  max_retries: 1
+  timeout_minutes: 90
+  delta_retention_hours: 168
+  use_spot_instances: true
+  min_workers: 1
+  max_workers: 4
+  cluster_policy_name: dataplatform-ite-jobs
+  spark_version: 15.4.x-scala2.12
+  node_type_id: Standard_D4ds_v5

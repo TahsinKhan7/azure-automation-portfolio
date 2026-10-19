@@ -1,0 +1,169 @@
+# Stage: validate -> what-if -> (optional manual validation) -> deploy for one environment.
+#
+# Every environment runs exactly the same steps against the same packaged templates; only the
+# parameters differ. Gates, from cheapest to most expensive:
+#   1. Test-AzResourceGroupDeployment  (schema, parameter and provider errors)
+#   2. What-if                          (intended change set, published to the run summary)
+#   3. ManualValidation@0               (preprod/prod: a human confirms the what-if)
+#   4. Environment approvals            (configured on the Azure DevOps Environment, outside YAML)
+#   5. Deployment                       (Incremental mode from the Template Spec version)
+
+parameters:
+  - name: environment
+    type: string
+    values: [dev, ite, iqe, preprod, prod]
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: succeeded()
+  - name: serviceConnection
+    type: string
+  - name: resourceGroupName
+    type: string
+  - name: templateSpecResourceGroup
+    type: string
+  - name: templateSpecName
+    type: string
+    default: 'dataplatform-landing-zone'
+  - name: location
+    type: string
+    default: 'uksouth'
+  - name: parameterFile
+    type: string
+    default: ''               # relative to the arm-templates artefact root; defaults to parameters/main.<environment>.parameters.json
+  - name: variableGroup
+    type: string
+    default: ''
+  - name: requireManualValidation
+    type: boolean
+    default: false
+  - name: manualValidationTimeoutMinutes
+    type: number
+    default: 2880             # 2 days, then the stage is rejected rather than left hanging
+  - name: notifyUsers
+    type: string
+    default: ''
+  - name: failOnDelete
+    type: boolean
+    default: false
+  - name: validateOnly
+    type: boolean
+    default: false            # true for pull request runs: validate + what-if, no deployment
+  - name: vmImage
+    type: string
+    default: 'ubuntu-latest'
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    ${{ if parameters.validateOnly }}:
+      displayName: '${{ upper(parameters.environment) }} (validate only)'
+    ${{ else }}:
+      displayName: '${{ upper(parameters.environment) }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    variables:
+      - ${{ if ne(parameters.variableGroup, '') }}:
+          - group: ${{ parameters.variableGroup }}
+      - name: parameterFile
+        value: ${{ coalesce(parameters.parameterFile, format('parameters/main.{0}.parameters.json', parameters.environment)) }}
+    jobs:
+      # ----------------------------------------------------------------------------------
+      # 1-2. Publish the Template Spec version, validate, what-if
+      # ----------------------------------------------------------------------------------
+      - job: Validate
+        displayName: 'Validate and what-if'
+        pool:
+          vmImage: '${{ parameters.vmImage }}'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - download: current
+            artifact: arm-templates
+            displayName: 'Download packaged templates'
+
+          - template: ../steps/arm-publish-template-spec.yml
+            parameters:
+              serviceConnection: ${{ parameters.serviceConnection }}
+              templateSpecName: ${{ parameters.templateSpecName }}
+              templateSpecResourceGroup: ${{ parameters.templateSpecResourceGroup }}
+              location: ${{ parameters.location }}
+              templateFile: '$(Pipeline.Workspace)/arm-templates/templates/main.json'
+
+          - task: AzureCLI@2
+            displayName: 'Ensure resource group exists for validation'
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az group create --name "${{ parameters.resourceGroupName }}" --location "${{ parameters.location }}" \
+                  --tags platform=dataplatform environment=${{ parameters.environment }} managedBy=pipeline --output none
+
+          - template: ../steps/arm-validate.yml
+            parameters:
+              serviceConnection: ${{ parameters.serviceConnection }}
+              resourceGroupName: ${{ parameters.resourceGroupName }}
+              environment: ${{ parameters.environment }}
+              parameterFile: '$(Pipeline.Workspace)/arm-templates/$(parameterFile)'
+              templateSpecId: '$(PublishTemplateSpec.templateSpecId)'
+
+          - template: ../steps/arm-whatif.yml
+            parameters:
+              serviceConnection: ${{ parameters.serviceConnection }}
+              resourceGroupName: ${{ parameters.resourceGroupName }}
+              environment: ${{ parameters.environment }}
+              parameterFile: '$(Pipeline.Workspace)/arm-templates/$(parameterFile)'
+              templateSpecId: '$(PublishTemplateSpec.templateSpecId)'
+              failOnDelete: ${{ parameters.failOnDelete }}
+
+      # ----------------------------------------------------------------------------------
+      # 3. Manual validation of the what-if (agentless job, preprod and prod only)
+      # ----------------------------------------------------------------------------------
+      - ${{ if and(parameters.requireManualValidation, not(parameters.validateOnly)) }}:
+          - job: ManualValidation
+            displayName: 'Review what-if for ${{ parameters.environment }}'
+            dependsOn: Validate
+            pool: server
+            timeoutInMinutes: ${{ parameters.manualValidationTimeoutMinutes }}
+            variables:
+              deleteCount: $[ dependencies.Validate.outputs['ArmWhatIf.whatIfDeleteCount'] ]
+              createCount: $[ dependencies.Validate.outputs['ArmWhatIf.whatIfCreateCount'] ]
+              modifyCount: $[ dependencies.Validate.outputs['ArmWhatIf.whatIfModifyCount'] ]
+            steps:
+              - task: ManualValidation@0
+                displayName: 'Confirm what-if for ${{ parameters.environment }}'
+                timeoutInMinutes: ${{ parameters.manualValidationTimeoutMinutes }}
+                inputs:
+                  notifyUsers: '${{ parameters.notifyUsers }}'
+                  onTimeout: reject
+                  instructions: |
+                    Review the what-if analysis for ${{ parameters.environment }} before resuming.
+
+                    Summary: $(createCount) create, $(modifyCount) modify, $(deleteCount) delete.
+
+                    1. Open this run's summary tab and read "What-if analysis: dataplatform ${{ parameters.environment }}"
+                       (also published as the artefact whatif-${{ parameters.environment }}).
+                    2. Confirm every Create/Modify/Delete is explained by the release plan change list.
+                    3. Confirm the change window in docs/release-management/environment-matrix.md is open.
+                    4. Resume only when the release plan approvals section is complete; reject otherwise.
+
+      # ----------------------------------------------------------------------------------
+      # 4-5. Deployment (Environment approvals run before this job starts)
+      # ----------------------------------------------------------------------------------
+      - ${{ if not(parameters.validateOnly) }}:
+          - template: ../jobs/arm-deploy.yml
+            parameters:
+              environment: ${{ parameters.environment }}
+              serviceConnection: ${{ parameters.serviceConnection }}
+              resourceGroupName: ${{ parameters.resourceGroupName }}
+              location: ${{ parameters.location }}
+              parameterFile: $(parameterFile)
+              templateSpecId: $[ dependencies.Validate.outputs['PublishTemplateSpec.templateSpecId'] ]
+              dependsOn:
+                - Validate
+                - ${{ if parameters.requireManualValidation }}:
+                    - ManualValidation
+              vmImage: ${{ parameters.vmImage }}

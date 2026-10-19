@@ -1,0 +1,689 @@
+name: CI
+
+# Repository-wide quality gate. Every area of the repo has its own job; on pull
+# requests only the areas that changed run (dorny/paths-filter), on pushes to main
+# and manual runs everything runs. The final `ci-status` job aggregates the
+# results so a single required check (and the README badge) reflects the whole
+# pipeline.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # Explicit bash gives `-o pipefail`, so a failure inside a pipe fails the step.
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  TERRAFORM_VERSION: "1.9.8"
+  TFLINT_VERSION: "v0.53.0"
+  KUBECTL_VERSION: "v1.31.2"
+  KUBECONFORM_VERSION: "0.7.0"
+  DATABRICKS_CLI_VERSION: "0.299.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Work out which areas changed so PR builds stay fast.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.areas.outputs.python }}
+      terraform: ${{ steps.areas.outputs.terraform }}
+      terraform_dirs: ${{ steps.tf-dirs.outputs.dirs }}
+      bicep: ${{ steps.areas.outputs.bicep }}
+      arm: ${{ steps.areas.outputs.arm }}
+      powershell: ${{ steps.areas.outputs.powershell }}
+      kubernetes: ${{ steps.areas.outputs.kubernetes }}
+      sql: ${{ steps.areas.outputs.sql }}
+      databricks: ${{ steps.areas.outputs.databricks }}
+      markdown: ${{ steps.areas.outputs.markdown }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths (pull requests only)
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            python:
+              - 'python/**'
+              - '.github/workflows/ci.yml'
+            terraform:
+              - 'terraform/**'
+              - 'scripts/ci/terraform-validate-all.sh'
+              - '.github/workflows/ci.yml'
+            bicep:
+              - 'arm-bicep/**'
+              - '.github/workflows/ci.yml'
+            arm:
+              - 'arm-templates/**'
+              - 'scripts/ci/validate-json.sh'
+              - '.github/workflows/ci.yml'
+            powershell:
+              - 'powershell/**'
+              - '.github/workflows/ci.yml'
+            kubernetes:
+              - 'kubernetes/**'
+              - 'scripts/ci/install-kubeconform.sh'
+              - '.github/workflows/ci.yml'
+            sql:
+              - 'sql/**'
+              - '.sqlfluff'
+              - '.github/workflows/ci.yml'
+            databricks:
+              - 'databricks-bundles/**'
+              - 'python/**'
+              - '.github/workflows/ci.yml'
+            markdown:
+              - '**/*.md'
+              - '.markdownlint.yml'
+
+      - name: Resolve areas to run
+        id: areas
+        env:
+          RUN_ALL: ${{ github.event_name != 'pull_request' }}
+          FILTER_JSON: ${{ toJson(steps.filter.outputs) }}
+        run: |
+          for area in python terraform bicep arm powershell kubernetes sql databricks markdown; do
+            if [ "$RUN_ALL" = "true" ]; then
+              value=true
+            else
+              value=$(jq -r --arg a "$area" '.[$a] // "false"' <<< "$FILTER_JSON")
+            fi
+            echo "${area}=${value}" >> "$GITHUB_OUTPUT"
+            echo "${area}: ${value}"
+          done
+
+      - name: Discover Terraform directories for the matrix
+        id: tf-dirs
+        run: |
+          dirs=$(scripts/ci/terraform-validate-all.sh --list)
+          echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
+          echo "Terraform directories: ${dirs}"
+
+  # ---------------------------------------------------------------------------
+  # Python package: ruff + pytest (PySpark 3.5 needs Java 17) + wheel build
+  # ---------------------------------------------------------------------------
+  python-tests:
+    name: Python package
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17 (required by local PySpark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      - name: Install package with development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff check)
+        run: ruff check . --output-format=github
+
+      - name: Formatting (ruff format --check)
+        run: ruff format --check .
+
+      - name: Unit tests (pytest)
+        env:
+          PYSPARK_PYTHON: python
+          PYSPARK_DRIVER_PYTHON: python
+          SPARK_LOCAL_IP: 127.0.0.1
+        run: |
+          mkdir -p ../test-results
+          pytest -q --junitxml=../test-results/python.xml
+
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir ../dist
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-results
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish test results as a check
+        # Skipped for pull requests from forks, where the token cannot write checks.
+        if: >-
+          always() &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          check_name: Python test results
+          files: test-results/python.xml
+          comment_mode: off
+
+  # ---------------------------------------------------------------------------
+  # Terraform: fmt + tflint + terraform test (repo-wide), then validate per dir
+  # ---------------------------------------------------------------------------
+  terraform-lint:
+    name: Terraform fmt, tflint and tests
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff terraform/
+
+      - name: Set up tflint ${{ env.TFLINT_VERSION }}
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tflint
+        working-directory: terraform
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TFLINT_CONFIG: ${{ github.workspace }}/terraform/.tflint.hcl
+        run: |
+          tflint --version
+          tflint --init --config "$TFLINT_CONFIG"
+          tflint --recursive --config "$TFLINT_CONFIG" --format compact
+
+      - name: terraform test
+        # Only runs when the repository has a terraform/tests folder.
+        if: hashFiles('terraform/tests/**') != ''
+        working-directory: terraform/tests
+        run: |
+          terraform init -backend=false -input=false
+          terraform test -test-directory=.
+
+  terraform-validate:
+    name: Terraform validate (${{ matrix.dir }})
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true' && needs.changes.outputs.terraform_dirs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJson(needs.changes.outputs.terraform_dirs) }}
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Cache provider plugins
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: >-
+            tf-plugins-${{ runner.os }}-${{ env.TERRAFORM_VERSION }}-${{
+            hashFiles('terraform/**/.terraform.lock.hcl', 'terraform/**/versions.tf', 'terraform/**/providers.tf') }}
+          restore-keys: |
+            tf-plugins-${{ runner.os }}-${{ env.TERRAFORM_VERSION }}-
+
+      - name: terraform init -backend=false && terraform validate
+        env:
+          TF_DIR: ${{ matrix.dir }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          scripts/ci/terraform-validate-all.sh "$TF_DIR"
+
+  # ---------------------------------------------------------------------------
+  # Bicep: compile every template and parameter file with the Azure CLI
+  # ---------------------------------------------------------------------------
+  bicep-build:
+    name: Bicep build
+    needs: changes
+    if: needs.changes.outputs.bicep == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      - name: Build templates and parameter files
+        run: |
+          shopt -s nullglob
+          status=0
+          for file in arm-bicep/*.bicep; do
+            echo "::group::az bicep build ${file}"
+            if ! az bicep build --file "$file" --stdout > /dev/null; then
+              echo "::error file=${file}::Bicep build failed"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          for params in arm-bicep/parameters/*.bicepparam; do
+            echo "::group::az bicep build-params ${params}"
+            if ! az bicep build-params --file "$params" --stdout > /dev/null; then
+              echo "::error file=${params}::Bicep parameter build failed"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # ---------------------------------------------------------------------------
+  # ARM JSON: JSON lint over the whole repo, then Azure ARM-TTK on the templates
+  # ---------------------------------------------------------------------------
+  arm-ttk:
+    name: ARM templates (JSON lint + ARM-TTK)
+    needs: changes
+    if: needs.changes.outputs.arm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Lint every JSON file in the repository
+        run: scripts/ci/validate-json.sh
+
+      - name: Clone ARM-TTK
+        run: git clone --depth 1 https://github.com/Azure/arm-ttk.git "$RUNNER_TEMP/arm-ttk"
+
+      - name: Run ARM-TTK against arm-templates/templates
+        shell: pwsh
+        env:
+          # Optional comma-separated list of ARM-TTK tests to skip, set as a repository variable.
+          ARM_TTK_SKIP: ${{ vars.ARM_TTK_SKIP }}
+        run: |
+          # GitHub-hosted pwsh sets $ErrorActionPreference = 'Stop'; keep going so every template is reported.
+          $ErrorActionPreference = 'Continue'
+          Import-Module "$env:RUNNER_TEMP/arm-ttk/arm-ttk/arm-ttk.psd1" -Force
+
+          $schemaPattern = '"\$schema"\s*:\s*"https://schema\.management\.azure\.com/schemas/[^"]*deploymentTemplate\.json#?"'
+          $templates = Get-ChildItem -Path 'arm-templates/templates' -Recurse -Filter '*.json' |
+            Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -match $schemaPattern }
+
+          if (-not $templates) {
+            Write-Warning 'No ARM deployment templates found under arm-templates/templates.'
+            exit 0
+          }
+
+          $skip = @()
+          if ($env:ARM_TTK_SKIP) { $skip = $env:ARM_TTK_SKIP -split ',' | ForEach-Object { $_.Trim() } }
+
+          $totalFailed = 0
+          $rows = @('| Template | Passed | Failed |', '|---|---:|---:|')
+          foreach ($template in $templates) {
+            $relative = [System.IO.Path]::GetRelativePath((Get-Location).Path, $template.FullName)
+            Write-Host "::group::ARM-TTK ${relative}"
+            $params = @{ TemplatePath = $template.FullName }
+            if ($skip.Count -gt 0) { $params.Skip = $skip }
+            $results = @(Test-AzTemplate @params)
+            $failed = @($results | Where-Object { -not $_.Passed })
+            $passed = @($results | Where-Object { $_.Passed })
+            foreach ($r in $failed) {
+              $messages = ($r.Errors | ForEach-Object { $_.Exception.Message }) -join '; '
+              Write-Host "::error file=${relative}::[$($r.Group)] $($r.Name): ${messages}"
+            }
+            Write-Host "Passed: $($passed.Count)  Failed: $($failed.Count)"
+            Write-Host '::endgroup::'
+            $rows += "| ${relative} | $($passed.Count) | $($failed.Count) |"
+            $totalFailed += $failed.Count
+          }
+
+          @('## ARM-TTK results', '') + $rows | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($totalFailed -gt 0) {
+            Write-Host "::error::ARM-TTK reported ${totalFailed} failing test(s)."
+            exit 1
+          }
+
+  # ---------------------------------------------------------------------------
+  # PowerShell: PSScriptAnalyzer (fail on Error) + Pester 5 with NUnit results
+  # ---------------------------------------------------------------------------
+  powershell-quality:
+    name: PowerShell quality
+    needs: changes
+    if: needs.changes.outputs.powershell == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer and Pester
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Get-Module -ListAvailable PSScriptAnalyzer, Pester | Select-Object Name, Version | Format-Table -AutoSize
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $settings = 'powershell/PSScriptAnalyzerSettings.psd1'
+          $params = @{ Path = 'powershell'; Severity = 'Error,Warning' }
+          if (Test-Path $settings) {
+            $params.Settings = $settings
+          } else {
+            Write-Warning "Settings file ${settings} not found; using default rules."
+          }
+
+          # PSScriptAnalyzer crashes intermittently while resolving command metadata in parallel
+          # (PowerShell/PSScriptAnalyzer#1351, still present in 1.25.0), and the broken state
+          # persists for the life of the process. The helper runs each attempt in a fresh pwsh
+          # process and returns the first complete set of findings unchanged.
+          $results = @(& ./scripts/ci/Invoke-ScriptAnalyzerWithRetry.ps1 @params)
+          foreach ($r in $results) {
+            $file = [System.IO.Path]::GetRelativePath((Get-Location).Path, $r.ScriptPath)
+            $level = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
+            Write-Host "::${level} file=${file},line=$($r.Line),col=$($r.Column)::[$($r.RuleName)] $($r.Message)"
+          }
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          $warnings = @($results | Where-Object Severity -eq 'Warning')
+          "## PSScriptAnalyzer`n`n- Errors: $($errors.Count)`n- Warnings: $($warnings.Count)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          Write-Host "Errors: $($errors.Count)  Warnings: $($warnings.Count) (warnings are reported, only errors fail the build)"
+          if ($errors.Count -gt 0) { exit 1 }
+
+      - name: Pester tests
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'powershell/tests')) { Write-Warning 'powershell/tests not found; nothing to run.'; exit 0 }
+          New-Item -ItemType Directory -Path 'test-results' -Force | Out-Null
+          # Equivalent to `Invoke-Pester -Path powershell/tests -CI` with an explicit NUnit output path.
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'powershell/tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = 'test-results/pester.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: powershell-test-results
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish test results as a check
+        if: >-
+          always() &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          check_name: PowerShell test results
+          files: test-results/pester.xml
+          comment_mode: off
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes: render each Kustomize overlay and validate against the API schema
+  # ---------------------------------------------------------------------------
+  kubernetes-validate:
+    name: Kubernetes (${{ matrix.environment }})
+    needs: changes
+    if: needs.changes.outputs.kubernetes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, ite, iqe, preprod, prod]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl ${{ env.KUBECTL_VERSION }}
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install kubeconform ${{ env.KUBECONFORM_VERSION }}
+        run: scripts/ci/install-kubeconform.sh
+
+      - name: Render overlay and validate manifests
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          mkdir -p rendered
+          kubectl kustomize "kubernetes/overlays/${ENVIRONMENT}" \
+            | tee "rendered/${ENVIRONMENT}.yaml" \
+            | kubeconform -strict -ignore-missing-schemas -summary
+
+      - name: Upload rendered manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-rendered-${{ matrix.environment }}
+          path: rendered/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # SQL: sqlfluff, T-SQL for Azure SQL scripts and Spark SQL for Databricks
+  # ---------------------------------------------------------------------------
+  sql-lint:
+    name: SQL lint (sqlfluff)
+    needs: changes
+    if: needs.changes.outputs.sql == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: .sqlfluff
+
+      - name: Install sqlfluff
+        run: pip install "sqlfluff~=3.2"
+
+      # Both lint steps are advisory (continue-on-error): the SQL scripts are
+      # hand-written DDL and a style finding must not block unrelated changes.
+      # Findings still appear as annotations and in the job log.
+      - name: Lint T-SQL (Azure SQL)
+        continue-on-error: true
+        run: |
+          mapfile -d '' files < <(find sql -type f -name '*.sql' -not -path 'sql/databricks-sql/*' -print0 | sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then echo "No T-SQL files found."; exit 0; fi
+          sqlfluff lint --dialect tsql --format github-annotation-native "${files[@]}"
+
+      - name: Lint Spark SQL (Databricks)
+        continue-on-error: true
+        run: |
+          if [ ! -d sql/databricks-sql ]; then echo "sql/databricks-sql not present."; exit 0; fi
+          sqlfluff lint sql/databricks-sql --dialect sparksql --format github-annotation-native
+
+  # ---------------------------------------------------------------------------
+  # YAML: yamllint over the whole repository (blocking)
+  # ---------------------------------------------------------------------------
+  yaml-lint:
+    name: YAML lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install yamllint
+        run: pip install "yamllint~=1.35"
+
+      - name: yamllint
+        run: yamllint -c .yamllint.yml -f github .
+
+  # ---------------------------------------------------------------------------
+  # Markdown: markdownlint-cli2 (advisory)
+  # ---------------------------------------------------------------------------
+  markdown-lint:
+    name: Markdown lint
+    needs: changes
+    if: needs.changes.outputs.markdown == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: markdownlint-cli2
+        # Advisory only: documentation style must not block code changes.
+        continue-on-error: true
+        uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          config: .markdownlint.yml
+          globs: |
+            **/*.md
+            !node_modules
+            !arm-ttk
+
+  # ---------------------------------------------------------------------------
+  # Databricks Asset Bundle: `bundle validate` needs a workspace, so this job
+  # only runs when the DATABRICKS_HOST repository variable is set (and the
+  # DATABRICKS_TOKEN secret alongside it). Without them it is skipped cleanly
+  # and ci-status treats "skipped" as a pass.
+  # ---------------------------------------------------------------------------
+  databricks-bundle-validate:
+    name: Databricks bundle validate
+    needs: changes
+    if: needs.changes.outputs.databricks == 'true' && vars.DATABRICKS_HOST != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+        working-directory: databricks-bundles
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Databricks CLI ${{ env.DATABRICKS_CLI_VERSION }}
+        # Databricks publishes this action from `main`; the CLI version itself is pinned below.
+        uses: databricks/setup-cli@main
+        with:
+          version: ${{ env.DATABRICKS_CLI_VERSION }}
+
+      - name: databricks bundle validate -t dev
+        run: |
+          databricks version
+          databricks bundle validate -t dev
+
+  # ---------------------------------------------------------------------------
+  # Single aggregated status for branch protection and the README badge.
+  # Skipped jobs (path filters, missing Databricks credentials) count as passed;
+  # anything that failed or was cancelled fails the build.
+  # ---------------------------------------------------------------------------
+  ci-status:
+    name: CI status
+    if: always()
+    needs:
+      - changes
+      - python-tests
+      - terraform-lint
+      - terraform-validate
+      - bicep-build
+      - arm-ttk
+      - powershell-quality
+      - kubernetes-validate
+      - sql-lint
+      - yaml-lint
+      - markdown-lint
+      - databricks-bundle-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate job results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          {
+            echo "## CI job results"
+            echo
+            echo "| Job | Result |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<< "$NEEDS_JSON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key' <<< "$NEEDS_JSON")
+          if [ -n "$failed" ]; then
+            echo "::error::The following jobs did not succeed: $(echo "$failed" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped by path filters."

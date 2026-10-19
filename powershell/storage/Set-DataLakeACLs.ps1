@@ -1,83 +1,76 @@
 <#
 .SYNOPSIS
-    Manages Azure Data Lake Storage Gen2 folder structures and ACL permissions.
-.DESCRIPTION
-    Creates medallion architecture folder hierarchy (bronze/silver/gold) and sets
-    POSIX ACLs for AD groups on each layer. Ensures consistent access patterns
-    across data lake containers.
-.EXAMPLE
-    .\Set-DataLakeACLs.ps1 -StorageAccount "stproddatalake001" -Container "datalake" -Apply
-#>
+    Creates the medallion folder hierarchy in an ADLS Gen2 container and applies group ACLs from a config file.
 
-[CmdletBinding()]
+.DESCRIPTION
+    Folder layout comes from Get-DpMedallionFolderLayout; the ACL plan is built
+    and validated by ConvertTo-DpDataLakeAclPlan (unit tested) before any
+    change is made. Without -Apply the script prints the plan only.
+
+.EXAMPLE
+    ./Set-DataLakeACLs.ps1 -StorageAccount stdpdataprod01 -Container bronze -ConfigFile ./config/datalake-acls.json -Apply
+#>
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $true)][string]$StorageAccount,
-    [Parameter(Mandatory = $true)][string]$Container,
-    [string]$ConfigFile = ".\config\datalake-acls.json",
+    [Parameter(Mandatory)]
+    [string]$StorageAccount,
+
+    [Parameter(Mandatory)]
+    [string]$Container,
+
+    [string]$ConfigFile = './config/datalake-acls.json',
+
     [switch]$Apply
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== Data Lake ACL Manager ===" -ForegroundColor Cyan
-Write-Host "Storage Account: $StorageAccount"
-Write-Host "Container:       $Container`n"
+Write-DpLog -Message "Data Lake ACLs: $StorageAccount/$Container"
 
-$ctx = New-AzStorageContext -StorageAccountName $StorageAccount -UseConnectedAccount
+$context = New-AzStorageContext -StorageAccountName $StorageAccount -UseConnectedAccount
 
-# Define medallion folder structure
-$folders = @(
-    "bronze", "bronze/raw", "bronze/landing",
-    "silver", "silver/cleansed", "silver/standardised",
-    "gold", "gold/aggregated", "gold/reporting",
-    "_checkpoints", "_schemas", "_logs"
-)
-
-# Create folders
-foreach ($folder in $folders) {
-    $existing = Get-AzDataLakeGen2Item -Context $ctx -FileSystem $Container -Path $folder -ErrorAction SilentlyContinue
-    if (-not $existing) {
-        if ($Apply) {
-            New-AzDataLakeGen2Item -Context $ctx -FileSystem $Container -Path $folder -Directory
-            Write-Host "  Created: $folder" -ForegroundColor Green
-        }
-        else {
-            Write-Host "  Would create: $folder" -ForegroundColor DarkGray
-        }
+foreach ($folder in Get-DpMedallionFolderLayout) {
+    $existing = Get-AzDataLakeGen2Item -Context $context -FileSystem $Container -Path $folder -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-DpLog -Message "  Exists: $folder" -Level Debug
+        continue
     }
-    else {
-        Write-Host "  Exists: $folder" -ForegroundColor Gray
+    if ($Apply -and $PSCmdlet.ShouldProcess("$Container/$folder", 'Create directory')) {
+        New-AzDataLakeGen2Item -Context $context -FileSystem $Container -Path $folder -Directory | Out-Null
+        Write-DpLog -Message "  Created: $folder" -Level Success
+    } else {
+        Write-DpLog -Message "  Would create: $folder"
     }
 }
 
-# Apply ACLs from config
-if (Test-Path $ConfigFile) {
-    $aclConfig = Get-Content $ConfigFile | ConvertFrom-Json
-    
-    foreach ($rule in $aclConfig.rules) {
-        $groupId = (Get-AzADGroup -DisplayName $rule.adGroup -ErrorAction SilentlyContinue).Id
-        
-        if (-not $groupId) {
-            Write-Warning "  AD group not found: $($rule.adGroup)"
-            continue
-        }
+if (-not (Test-Path -Path $ConfigFile)) {
+    Write-DpLog -Message "No ACL config at $ConfigFile; folders only." -Level Warning
+    return
+}
 
-        $permissions = $rule.permissions  # e.g. "rwx", "r-x", "r--"
-        
-        foreach ($path in $rule.paths) {
-            $acl = Set-AzDataLakeGen2ItemAclObject -AccessControlType group `
-                    -EntityId $groupId -Permission $permissions
-            
-            if ($Apply) {
-                Update-AzDataLakeGen2Item -Context $ctx -FileSystem $Container `
-                    -Path $path -Acl $acl
-                Write-Host "  ACL set: $($rule.adGroup) -> $permissions on $path" -ForegroundColor Green
-            }
-            else {
-                Write-Host "  Would set: $($rule.adGroup) -> $permissions on $path" -ForegroundColor DarkGray
-            }
-        }
+$rules = @((Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json).rules)
+$groupIds = @{}
+foreach ($groupName in ($rules.adGroup | Select-Object -Unique)) {
+    $group = Get-AzADGroup -DisplayName $groupName -ErrorAction SilentlyContinue
+    if ($group) { $groupIds[$groupName] = $group.Id }
+}
+
+$plan = ConvertTo-DpDataLakeAclPlan -Rule $rules -GroupObjectId $groupIds
+
+foreach ($entry in $plan) {
+    $acl = Set-AzDataLakeGen2ItemAclObject -AccessControlType group -EntityId $entry.GroupObjectId -Permission $entry.Permissions
+    if ($entry.ApplyDefault) {
+        $acl = Set-AzDataLakeGen2ItemAclObject -AccessControlType group -EntityId $entry.GroupObjectId -Permission $entry.Permissions -DefaultScope -InputObject $acl
+    }
+
+    if ($Apply -and $PSCmdlet.ShouldProcess("$Container/$($entry.Path)", "Grant $($entry.GroupName) $($entry.Permissions)")) {
+        Update-AzDataLakeGen2Item -Context $context -FileSystem $Container -Path $entry.Path -Acl $acl | Out-Null
+        Write-DpLog -Message "  ACL set: $($entry.GroupName) -> $($entry.Permissions) on $($entry.Path)" -Level Success
+    } else {
+        Write-DpLog -Message "  Would set: $($entry.GroupName) -> $($entry.Permissions) on $($entry.Path)"
     }
 }
 
-Write-Host "`nData Lake structure and ACLs configured." -ForegroundColor Cyan
+$plan

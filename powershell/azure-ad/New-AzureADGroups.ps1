@@ -1,95 +1,95 @@
 <#
 .SYNOPSIS
-    Creates and manages Azure AD security groups with nested group support.
-.DESCRIPTION
-    Bulk creates AD groups from a config file, adds members and nests groups
-    following enterprise naming conventions. Supports RBAC-aligned group structures.
-.EXAMPLE
-    .\New-AzureADGroups.ps1 -ConfigFile ".\config\ad-groups.json" -Apply
-#>
+    Creates Entra ID security groups from a JSON definition, with members and nested groups.
 
-[CmdletBinding()]
+.DESCRIPTION
+    Idempotent: existing groups are reused, existing memberships are skipped.
+    Without -Apply the script reports what it would do.
+
+.EXAMPLE
+    ./New-AzureADGroups.ps1 -ConfigFile ./config/ad-groups.json -Apply
+#>
+#Requires -Version 7.0
+[CmdletBinding(SupportsShouldProcess)]
 param (
-    [Parameter(Mandatory = $true)][string]$ConfigFile,
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+    [string]$ConfigFile,
+
     [switch]$Apply
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== Azure AD Group Management ===" -ForegroundColor Cyan
-if (-not $Apply) { Write-Host "PREVIEW MODE - use -Apply to commit changes.`n" -ForegroundColor Yellow }
+Write-DpLog -Message 'Entra ID group provisioning'
+if (-not $Apply) {
+    Write-DpLog -Message 'Preview mode: use -Apply to commit changes.' -Level Warning
+}
 
-$config = Get-Content $ConfigFile | ConvertFrom-Json
-$created = 0; $updated = 0; $nested = 0
+$config = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
+$created = 0
+$membersAdded = 0
+$nested = 0
+
+function Add-MemberIfMissing {
+    param ([string]$GroupId, [string]$MemberId, [string]$Label)
+
+    try {
+        Add-AzADGroupMember -TargetGroupObjectId $GroupId -MemberObjectId $MemberId -ErrorAction Stop
+        Write-DpLog -Message "    Added: $Label" -Level Success
+        return $true
+    } catch {
+        if ($_.Exception.Message -like '*already exist*') {
+            Write-DpLog -Message "    Already a member: $Label" -Level Debug
+            return $false
+        }
+        throw
+    }
+}
 
 foreach ($group in $config.groups) {
-    $displayName = $group.displayName
-    $description = $group.description
-    $mailNickname = $displayName -replace '\s', '-' -replace '[^a-zA-Z0-9\-]', ''
-
-    # Check if group exists
-    $existing = Get-AzADGroup -DisplayName $displayName -ErrorAction SilentlyContinue
+    $mailNickname = ($group.displayName -replace '\s', '-') -replace '[^a-zA-Z0-9\-]', ''
+    $existing = Get-AzADGroup -DisplayName $group.displayName -ErrorAction SilentlyContinue
 
     if (-not $existing) {
-        if ($Apply) {
-            $newGroup = New-AzADGroup -DisplayName $displayName `
-                                       -MailNickname $mailNickname `
-                                       -Description $description `
-                                       -SecurityEnabled
-            Write-Host "  Created: $displayName (ID: $($newGroup.Id))" -ForegroundColor Green
-            $existing = $newGroup
+        if ($Apply -and $PSCmdlet.ShouldProcess($group.displayName, 'Create security group')) {
+            $existing = New-AzADGroup -DisplayName $group.displayName -MailNickname $mailNickname -Description $group.description -SecurityEnabled
+            Write-DpLog -Message "  Created: $($group.displayName) ($($existing.Id))" -Level Success
             $created++
-        }
-        else {
-            Write-Host "  Would create: $displayName" -ForegroundColor DarkGray
+        } else {
+            Write-DpLog -Message "  Would create: $($group.displayName)"
             continue
         }
-    }
-    else {
-        Write-Host "  Exists: $displayName" -ForegroundColor Gray
+    } else {
+        Write-DpLog -Message "  Exists: $($group.displayName)" -Level Debug
     }
 
-    # Add direct members (users)
-    if ($group.members) {
-        foreach ($upn in $group.members) {
-            $user = Get-AzADUser -UserPrincipalName $upn -ErrorAction SilentlyContinue
-            if ($user -and $Apply) {
-                try {
-                    Add-AzADGroupMember -TargetGroupObjectId $existing.Id -MemberObjectId $user.Id -ErrorAction SilentlyContinue
-                    Write-Host "    Added member: $upn" -ForegroundColor Green
-                }
-                catch {
-                    if ($_.Exception.Message -like "*already exist*") {
-                        Write-Host "    Already member: $upn" -ForegroundColor DarkGray
-                    }
-                    else { Write-Warning "    Failed: $upn - $_" }
-                }
-                $updated++
-            }
+    foreach ($upn in @($group.members)) {
+        $user = Get-AzADUser -UserPrincipalName $upn -ErrorAction SilentlyContinue
+        if (-not $user) {
+            Write-DpLog -Message "    User not found: $upn" -Level Warning
+            continue
+        }
+        if ($Apply -and $PSCmdlet.ShouldProcess($group.displayName, "Add member $upn")) {
+            if (Add-MemberIfMissing -GroupId $existing.Id -MemberId $user.Id -Label $upn) { $membersAdded++ }
         }
     }
 
-    # Nest child groups
-    if ($group.nestedGroups) {
-        foreach ($childGroupName in $group.nestedGroups) {
-            $childGroup = Get-AzADGroup -DisplayName $childGroupName -ErrorAction SilentlyContinue
-            if ($childGroup -and $Apply) {
-                try {
-                    Add-AzADGroupMember -TargetGroupObjectId $existing.Id -MemberObjectId $childGroup.Id -ErrorAction SilentlyContinue
-                    Write-Host "    Nested group: $childGroupName -> $displayName" -ForegroundColor Green
-                    $nested++
-                }
-                catch {
-                    if ($_.Exception.Message -like "*already exist*") {
-                        Write-Host "    Already nested: $childGroupName" -ForegroundColor DarkGray
-                    }
-                }
-            }
+    foreach ($childName in @($group.nestedGroups)) {
+        $child = Get-AzADGroup -DisplayName $childName -ErrorAction SilentlyContinue
+        if (-not $child) {
+            Write-DpLog -Message "    Nested group not found: $childName" -Level Warning
+            continue
+        }
+        if ($Apply -and $PSCmdlet.ShouldProcess($group.displayName, "Nest group $childName")) {
+            if (Add-MemberIfMissing -GroupId $existing.Id -MemberId $child.Id -Label "$childName -> $($group.displayName)") { $nested++ }
         }
     }
 }
 
-Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "Groups created:  $created"
-Write-Host "Members updated: $updated"
-Write-Host "Groups nested:   $nested"
+[pscustomobject]@{
+    GroupsCreated = $created
+    MembersAdded  = $membersAdded
+    GroupsNested  = $nested
+}

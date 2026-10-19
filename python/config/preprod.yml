@@ -1,0 +1,29 @@
+# dataplatform configuration: preprod
+# Non-secret settings only. Secrets (tokens, connection strings) come from Key Vault
+# via the Databricks secret scope or DefaultAzureCredential at runtime.
+environment: preprod
+workspace_host: https://adb-0000000000000000.0.azuredatabricks.net
+key_vault_name: kv-dataplatform-preprod
+catalog: dataplatform_preprod
+
+storage:
+  account_name: stdataplatformpre
+  containers:
+    landing: landing
+    bronze: bronze
+    silver: silver
+    gold: gold
+    quarantine: quarantine
+    checkpoints: checkpoints
+
+job:
+  shuffle_partitions: 128
+  max_retries: 2
+  timeout_minutes: 180
+  delta_retention_hours: 336
+  use_spot_instances: false
+  min_workers: 2
+  max_workers: 8
+  cluster_policy_name: dataplatform-preprod-jobs
+  spark_version: 15.4.x-scala2.12
+  node_type_id: Standard_D4ds_v5

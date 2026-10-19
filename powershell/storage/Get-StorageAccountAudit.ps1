@@ -1,70 +1,45 @@
 <#
 .SYNOPSIS
-    Audits and manages Azure Storage Accounts across subscriptions.
-.DESCRIPTION
-    Reports on storage account configurations including access tiers,
-    replication, network rules, encryption and blob lifecycle policies.
-    Identifies non-compliant accounts for remediation.
-.EXAMPLE
-    .\Get-StorageAccountAudit.ps1 -SubscriptionId "xxxx" -OutputPath ".\reports\"
-#>
+    Audits storage accounts against the platform security baseline and exports the findings.
 
+.DESCRIPTION
+    The baseline (HTTPS only, TLS 1.2, no anonymous access, firewall Deny,
+    optionally Shared Key disabled) is implemented in
+    Test-DpStorageAccountCompliance and is unit tested.
+
+.EXAMPLE
+    ./Get-StorageAccountAudit.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000 -RequireSharedKeyDisabled
+#>
+#Requires -Version 7.0
 [CmdletBinding()]
 param (
     [string]$SubscriptionId,
-    [string]$OutputPath = ".\reports"
+
+    [string]$OutputPath = './reports',
+
+    [switch]$RequireSharedKeyDisabled,
+
+    [string[]]$RequiredTag = @('Environment', 'CostCentre')
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath '../modules/DataPlatform.Automation/DataPlatform.Automation.psd1') -Force
 
-Write-Host "`n=== Storage Account Audit ===" -ForegroundColor Cyan
+Write-DpLog -Message 'Storage account compliance audit'
 
-if ($SubscriptionId) { Set-AzContext -SubscriptionId $SubscriptionId | Out-Null }
+$report = Get-DpStorageAccountComplianceReport -SubscriptionId $SubscriptionId -RequireSharedKeyDisabled:$RequireSharedKeyDisabled -RequiredTag $RequiredTag
+$nonCompliant = @($report | Where-Object { -not $_.IsCompliant })
 
-$storageAccounts = Get-AzStorageAccount
-$report = @()
-
-foreach ($sa in $storageAccounts) {
-    $networkRules = $sa.NetworkRuleSet
-
-    $report += [PSCustomObject]@{
-        Name              = $sa.StorageAccountName
-        ResourceGroup     = $sa.ResourceGroupName
-        Location          = $sa.PrimaryLocation
-        Kind              = $sa.Kind
-        Sku               = $sa.Sku.Name
-        AccessTier        = $sa.AccessTier
-        HttpsOnly         = $sa.EnableHttpsTrafficOnly
-        MinTlsVersion     = $sa.MinimumTlsVersion
-        HnsEnabled        = $sa.EnableHierarchicalNamespace
-        BlobPublicAccess  = $sa.AllowBlobPublicAccess
-        NetworkDefault    = $networkRules.DefaultAction
-        VNetRules         = ($networkRules.VirtualNetworkRules | Measure-Object).Count
-        IpRules           = ($networkRules.IpRules | Measure-Object).Count
-        Compliant         = (
-            $sa.EnableHttpsTrafficOnly -eq $true -and
-            $sa.MinimumTlsVersion -eq "TLS1_2" -and
-            $networkRules.DefaultAction -eq "Deny" -and
-            $sa.AllowBlobPublicAccess -eq $false
-        )
-    }
+Write-DpLog -Message "Accounts: $($report.Count) | Compliant: $($report.Count - $nonCompliant.Count) | Non-compliant: $($nonCompliant.Count)"
+foreach ($account in $nonCompliant) {
+    Write-DpLog -Message "  $($account.Name): $($account.Findings)" -Level Warning
 }
 
-# Display summary
-$compliant = ($report | Where-Object { $_.Compliant }).Count
-$nonCompliant = ($report | Where-Object { -not $_.Compliant }).Count
-
-Write-Host "`nTotal accounts:   $($report.Count)"
-Write-Host "Compliant:        $compliant" -ForegroundColor Green
-Write-Host "Non-compliant:    $nonCompliant" -ForegroundColor $(if ($nonCompliant -gt 0) { "Red" } else { "Green" })
-
-if ($nonCompliant -gt 0) {
-    Write-Host "`nNon-compliant accounts:" -ForegroundColor Yellow
-    $report | Where-Object { -not $_.Compliant } | Format-Table Name, MinTlsVersion, NetworkDefault, BlobPublicAccess -AutoSize
+if (-not (Test-Path -Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
-
-# Export
-if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
-$file = Join-Path $OutputPath "storage-audit-$(Get-Date -Format 'yyyyMMdd').csv"
+$file = Join-Path -Path $OutputPath -ChildPath "storage-audit-$(Get-Date -Format 'yyyyMMdd').csv"
 $report | Export-Csv -Path $file -NoTypeInformation
-Write-Host "`nReport saved: $file" -ForegroundColor Green
+Write-DpLog -Message "Report saved: $file" -Level Success
+
+$report

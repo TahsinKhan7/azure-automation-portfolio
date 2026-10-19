@@ -1,0 +1,255 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Key Vault with RBAC authorisation, soft delete and purge protection, firewall rules, diagnostics, an optional private endpoint and a set of seeded secrets supplied as a secureObject.",
+    "author": "Tahsin Khan"
+  },
+  "parameters": {
+    "keyVaultName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique Key Vault name."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the vault."
+      }
+    },
+    "skuName": {
+      "type": "string",
+      "defaultValue": "standard",
+      "allowedValues": [
+        "standard",
+        "premium"
+      ],
+      "metadata": {
+        "description": "Vault SKU. Premium adds HSM-backed keys and is reserved for production."
+      }
+    },
+    "enablePurgeProtection": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Purge protection cannot be disabled once enabled. Keep true for preprod and prod; dev vaults may leave it off so they can be rebuilt freely."
+      }
+    },
+    "softDeleteRetentionInDays": {
+      "type": "int",
+      "defaultValue": 90,
+      "minValue": 7,
+      "maxValue": 90,
+      "metadata": {
+        "description": "Soft delete retention period in days."
+      }
+    },
+    "networkDefaultAction": {
+      "type": "string",
+      "defaultValue": "Deny",
+      "allowedValues": [
+        "Allow",
+        "Deny"
+      ],
+      "metadata": {
+        "description": "Default firewall action. Trusted Azure services (ADF, Databricks) are always allowed through the bypass."
+      }
+    },
+    "allowedIpRanges": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Public IPv4 addresses or CIDR ranges permitted through the vault firewall."
+      }
+    },
+    "allowedSubnetIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Subnet resource IDs permitted through the vault firewall via service endpoints."
+      }
+    },
+    "deployPrivateEndpoint": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Create a private endpoint for the vault and disable public network access."
+      }
+    },
+    "privateEndpointSubnetId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the subnet that hosts the private endpoint. Required when deployPrivateEndpoint is true."
+      }
+    },
+    "secretsObject": {
+      "type": "secureObject",
+      "metadata": {
+        "description": "Object with a 'secrets' array of { secretName, secretValue, contentType } items to seed into the vault."
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace for diagnostics. Leave empty to skip diagnostic settings."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags applied to every resource in this module."
+      }
+    }
+  },
+  "variables": {
+    "keyVaultId": "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]",
+    "privateEndpointName": "[format('pep-{0}-vault', parameters('keyVaultName'))]",
+    "deployDiagnostics": "[not(empty(parameters('logAnalyticsWorkspaceId')))]",
+    "secretCount": "[length(parameters('secretsObject').secrets)]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2025-05-01",
+      "name": "[parameters('keyVaultName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "tenantId": "[subscription().tenantId]",
+        "sku": {
+          "family": "A",
+          "name": "[parameters('skuName')]"
+        },
+        "enableRbacAuthorization": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": "[parameters('softDeleteRetentionInDays')]",
+        "enablePurgeProtection": "[if(parameters('enablePurgeProtection'), true(), null())]",
+        "enabledForDeployment": false,
+        "enabledForDiskEncryption": false,
+        "enabledForTemplateDeployment": true,
+        "publicNetworkAccess": "[if(parameters('deployPrivateEndpoint'), 'Disabled', 'Enabled')]",
+        "networkAcls": {
+          "bypass": "AzureServices",
+          "defaultAction": "[parameters('networkDefaultAction')]",
+          "copy": [
+            {
+              "name": "ipRules",
+              "count": "[length(parameters('allowedIpRanges'))]",
+              "input": {
+                "value": "[parameters('allowedIpRanges')[copyIndex('ipRules')]]"
+              }
+            },
+            {
+              "name": "virtualNetworkRules",
+              "count": "[length(parameters('allowedSubnetIds'))]",
+              "input": {
+                "id": "[parameters('allowedSubnetIds')[copyIndex('virtualNetworkRules')]]",
+                "ignoreMissingVnetServiceEndpoint": false
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2025-05-01",
+      "name": "[format('{0}/{1}', parameters('keyVaultName'), parameters('secretsObject').secrets[copyIndex()].secretName)]",
+      "dependsOn": [
+        "[variables('keyVaultId')]"
+      ],
+      "copy": {
+        "name": "secretLoop",
+        "count": "[variables('secretCount')]"
+      },
+      "properties": {
+        "value": "[parameters('secretsObject').secrets[copyIndex()].secretValue]",
+        "contentType": "[parameters('secretsObject').secrets[copyIndex()].contentType]",
+        "attributes": {
+          "enabled": true
+        }
+      }
+    },
+    {
+      "condition": "[parameters('deployPrivateEndpoint')]",
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2025-05-01",
+      "name": "[variables('privateEndpointName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "dependsOn": [
+        "[variables('keyVaultId')]"
+      ],
+      "properties": {
+        "subnet": {
+          "id": "[parameters('privateEndpointSubnetId')]"
+        },
+        "customNetworkInterfaceName": "[format('nic-{0}', variables('privateEndpointName'))]",
+        "privateLinkServiceConnections": [
+          {
+            "name": "[format('plsc-{0}-vault', parameters('keyVaultName'))]",
+            "properties": {
+              "privateLinkServiceId": "[variables('keyVaultId')]",
+              "groupIds": [
+                "vault"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "condition": "[variables('deployDiagnostics')]",
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[format('Microsoft.KeyVault/vaults/{0}', parameters('keyVaultName'))]",
+      "name": "diag-to-log-analytics",
+      "dependsOn": [
+        "[variables('keyVaultId')]"
+      ],
+      "properties": {
+        "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+        "logs": [
+          {
+            "category": "AuditEvent",
+            "enabled": true
+          },
+          {
+            "category": "AzurePolicyEvaluationDetails",
+            "enabled": true
+          }
+        ],
+        "metrics": [
+          {
+            "category": "AllMetrics",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "keyVaultId": {
+      "type": "string",
+      "value": "[variables('keyVaultId')]"
+    },
+    "keyVaultName": {
+      "type": "string",
+      "value": "[parameters('keyVaultName')]"
+    },
+    "keyVaultUri": {
+      "type": "string",
+      "value": "[reference(variables('keyVaultId'), '2023-07-01').vaultUri]"
+    },
+    "seededSecretCount": {
+      "type": "int",
+      "value": "[variables('secretCount')]"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+# Data quality expectations for the silver claims table.
+# Severity "error" blocks promotion to gold; "warn" is reported but does not fail the gate.
+dataset: claims_silver
+description: Conformed claims; one row per claim_id, amounts non-negative, recent data present.
+expectations:
+  - type: schema
+    columns:
+      claim_id: string
+      policy_number: string
+      claim_date: date
+      claim_amount: decimal(18,2)
+  - type: not_null
+    columns: [claim_id, policy_number, claim_date]
+  - type: unique
+    columns: [claim_id]
+  - type: accepted_values
+    column: claim_type
+    values: [motor, home, health, life, travel]
+  - type: value_range
+    column: claim_amount
+    min: 0
+    max: 5000000
+  - type: regex
+    column: policy_number
+    pattern: "^POL-[0-9]{6}$"
+  - type: no_negative
+    columns: [claim_amount]
+  - type: row_count
+    min: 1
+  - type: freshness
+    column: _processed_at
+    max_hours: 48
+    severity: warn

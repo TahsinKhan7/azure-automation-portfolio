@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+test-results/
+pip-wheel-metadata/
+
+# ---------------------------------------------------------------------------
+# Terraform (lock files are committed on purpose; state never is)
+# ---------------------------------------------------------------------------
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.auto.tfvars.json
+
+# ---------------------------------------------------------------------------
+# PowerShell / Pester
+# ---------------------------------------------------------------------------
+TestResults/
+testResults.xml
+*.nupkg
+
+# ---------------------------------------------------------------------------
+# Databricks
+# ---------------------------------------------------------------------------
+.databricks/
+.databrickscfg
+
+# ---------------------------------------------------------------------------
+# Tooling cloned or generated in CI
+# ---------------------------------------------------------------------------
+arm-ttk/
+.tflint.d/
+kubeconform
+.sqlfluff_cache/
+
+# ---------------------------------------------------------------------------
+# IDE and OS noise
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Local configuration and secrets (never committed)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.pfx
+*.key
+local.settings.json

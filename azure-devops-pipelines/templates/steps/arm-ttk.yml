@@ -1,0 +1,50 @@
+# Steps: run ARM-TTK over a template folder and publish the JUnit results.
+#
+# Skipped tests come from arm-templates/arm-ttk.config.json (each with a reason) merged with
+# the optional `skip` list below (an empty list renders as -Skip '' which the script ignores). Results appear in the Tests tab of the pipeline run.
+
+parameters:
+  - name: templatePath
+    type: string
+    default: 'arm-templates/templates'
+  - name: configFile
+    type: string
+    default: 'arm-templates/arm-ttk.config.json'
+  - name: scriptPath
+    type: string
+    default: 'powershell/arm/Invoke-ArmTtk.ps1'
+  - name: resultsFile
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)/TestResults/arm-ttk-results.xml'
+  - name: skip
+    type: object
+    default: []
+  - name: failOnWarnings
+    type: boolean
+    default: false
+
+steps:
+  - task: PowerShell@2
+    displayName: 'ARM-TTK: Test-AzTemplate'
+    inputs:
+      pwsh: true
+      targetType: filePath
+      filePath: '${{ parameters.scriptPath }}'
+      failOnStderr: false
+      arguments: >-
+        -TemplatePath '${{ parameters.templatePath }}'
+        -ConfigFile '${{ parameters.configFile }}'
+        -ResultsFile '${{ parameters.resultsFile }}'
+        -FailOnWarnings:$${{ parameters.failOnWarnings }}
+        -Skip '${{ join(''',''', parameters.skip) }}'
+        -Verbose
+
+  - task: PublishTestResults@2
+    displayName: 'Publish ARM-TTK results'
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: '${{ parameters.resultsFile }}'
+      testRunTitle: 'ARM-TTK (${{ parameters.templatePath }})'
+      failTaskOnFailedTests: true
+      mergeTestResults: true

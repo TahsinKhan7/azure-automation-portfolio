@@ -1,0 +1,227 @@
+# =============================================================================
+# dataplatform-aks : render, validate and deploy the Kustomize overlays to AKS
+# -----------------------------------------------------------------------------
+#   Render         kubectl kustomize for every overlay, kubeconform schema
+#                  validation, rendered manifests published as an artefact
+#   Deploy_<env>   KubernetesManifest@1 through the workload-identity service
+#                  connection; runOnce for non-production, canary (20 %) with
+#                  automatic promote/reject for prod
+# =============================================================================
+name: k8s-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - kubernetes/**
+      - scripts/ci/install-kubeconform.sh
+      - azure-devops-pipelines/kubernetes-deploy.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - kubernetes/**
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: environments
+    displayName: Environments in promotion order
+    type: object
+    default:
+      - name: dev
+        serviceConnection: sc-dataplatform-dev
+        dependsOn: [Render]
+        strategy: runOnce
+      - name: ite
+        serviceConnection: sc-dataplatform-ite
+        dependsOn: [Deploy_dev]
+        strategy: runOnce
+      - name: iqe
+        serviceConnection: sc-dataplatform-iqe
+        dependsOn: [Deploy_ite]
+        strategy: runOnce
+      - name: preprod
+        serviceConnection: sc-dataplatform-preprod
+        dependsOn: [Deploy_iqe]
+        strategy: runOnce
+      - name: prod
+        serviceConnection: sc-dataplatform-prod
+        dependsOn: [Deploy_preprod]
+        strategy: canary
+        canaryPercentage: 20
+  - name: kubectlVersion
+    type: string
+    default: '1.31.2'
+  - name: deploy
+    displayName: Deploy after render (unticked = render and validate only)
+    type: boolean
+    default: true
+
+variables:
+  - name: artifactName
+    value: kubernetes-manifests
+  - name: manifestsRoot
+    value: $(Pipeline.Workspace)/$(artifactName)
+
+stages:
+  # ---------------------------------------------------------------------------
+  - stage: Render
+    displayName: Render and validate overlays
+    jobs:
+      - job: Render
+        displayName: kustomize + kubeconform
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: KubectlInstaller@0
+            displayName: Install kubectl ${{ parameters.kubectlVersion }}
+            inputs:
+              kubectlVersion: ${{ parameters.kubectlVersion }}
+
+          - bash: scripts/ci/install-kubeconform.sh
+            displayName: Install kubeconform (pinned, checksum verified)
+
+          - ${{ each env in parameters.environments }}:
+              - bash: |
+                  set -euo pipefail
+                  out="$(Build.ArtifactStagingDirectory)/${{ env.name }}"
+                  mkdir -p "$out"
+                  kubectl kustomize "kubernetes/overlays/${{ env.name }}" > "$out/manifests.yaml"
+                  kubeconform -strict -ignore-missing-schemas -summary "$out/manifests.yaml"
+                displayName: Render + validate ${{ env.name }}
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish rendered manifests
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: $(artifactName)
+              publishLocation: pipeline
+
+  # ---------------------------------------------------------------------------
+  - ${{ if eq(parameters.deploy, true) }}:
+      - ${{ each env in parameters.environments }}:
+          - stage: Deploy_${{ env.name }}
+            displayName: Deploy to AKS ${{ env.name }}
+            dependsOn: ${{ env.dependsOn }}
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            variables:
+              # Variable group per environment: aksResourceGroup, aksClusterName, namespace.
+              - group: dataplatform-aks-${{ env.name }}
+              - name: manifestFile
+                value: $(manifestsRoot)/${{ env.name }}/manifests.yaml
+            jobs:
+              - deployment: Deploy
+                displayName: ${{ env.name }} (${{ env.strategy }})
+                environment: dataplatform-${{ env.name }}
+                timeoutInMinutes: 30
+                strategy:
+                  # -------------------------- canary (prod) --------------------------
+                  ${{ if eq(env.strategy, 'canary') }}:
+                    canary:
+                      increments:
+                        - ${{ env.canaryPercentage }}
+                      deploy:
+                        steps:
+                          - download: current
+                            artifact: $(artifactName)
+
+                          - task: KubernetesManifest@1
+                            displayName: Deploy canary ($(strategy.increment) %)
+                            inputs:
+                              action: deploy
+                              connectionType: azureResourceManager
+                              azureSubscriptionConnection: ${{ env.serviceConnection }}
+                              azureResourceGroup: $(aksResourceGroup)
+                              kubernetesCluster: $(aksClusterName)
+                              useClusterAdmin: false
+                              namespace: $(namespace)
+                              strategy: canary
+                              trafficSplitMethod: pod
+                              percentage: $(strategy.increment)
+                              manifests: $(manifestFile)
+                              rolloutStatusTimeout: '300'
+
+                      postRouteTraffic:
+                        steps:
+                          - task: AzureCLI@2
+                            displayName: Canary health check
+                            inputs:
+                              azureSubscription: ${{ env.serviceConnection }}
+                              scriptType: bash
+                              scriptLocation: inlineScript
+                              inlineScript: |
+                                set -euo pipefail
+                                az aks get-credentials --resource-group "$(aksResourceGroup)" \
+                                  --name "$(aksClusterName)" --overwrite-existing
+                                kubelogin convert-kubeconfig -l azurecli
+                                echo "Waiting for canary pods to be Ready..."
+                                kubectl -n "$(namespace)" wait --for=condition=Ready pod -l azure-pipelines/version=canary --timeout=180s
+                                kubectl -n "$(namespace)" get pods -l azure-pipelines/version=canary -o wide
+                                jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}'
+                                restarts=$(kubectl -n "$(namespace)" get pods -l azure-pipelines/version=canary \
+                                  -o jsonpath="$jsonpath" | awk '{s+=$1} END {print s+0}')
+                                if [ "$restarts" -gt 0 ]; then
+                                  echo "##vso[task.logissue type=error]Canary pods restarted ${restarts} time(s); rejecting."
+                                  exit 1
+                                fi
+
+                      on:
+                        failure:
+                          steps:
+                            - task: KubernetesManifest@1
+                              displayName: Reject canary
+                              inputs:
+                                action: reject
+                                connectionType: azureResourceManager
+                                azureSubscriptionConnection: ${{ env.serviceConnection }}
+                                azureResourceGroup: $(aksResourceGroup)
+                                kubernetesCluster: $(aksClusterName)
+                                useClusterAdmin: false
+                                namespace: $(namespace)
+                                strategy: canary
+                                manifests: $(manifestFile)
+                        success:
+                          steps:
+                            - task: KubernetesManifest@1
+                              displayName: Promote canary to stable
+                              inputs:
+                                action: promote
+                                connectionType: azureResourceManager
+                                azureSubscriptionConnection: ${{ env.serviceConnection }}
+                                azureResourceGroup: $(aksResourceGroup)
+                                kubernetesCluster: $(aksClusterName)
+                                useClusterAdmin: false
+                                namespace: $(namespace)
+                                strategy: canary
+                                manifests: $(manifestFile)
+
+                  # -------------------------- runOnce (non-prod) ---------------------
+                  ${{ else }}:
+                    runOnce:
+                      deploy:
+                        steps:
+                          - download: current
+                            artifact: $(artifactName)
+
+                          - task: KubernetesManifest@1
+                            displayName: Deploy manifests
+                            inputs:
+                              action: deploy
+                              connectionType: azureResourceManager
+                              azureSubscriptionConnection: ${{ env.serviceConnection }}
+                              azureResourceGroup: $(aksResourceGroup)
+                              kubernetesCluster: $(aksClusterName)
+                              useClusterAdmin: false
+                              namespace: $(namespace)
+                              manifests: $(manifestFile)
+                              rolloutStatusTimeout: '300'

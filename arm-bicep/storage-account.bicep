@@ -40,13 +40,13 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
     networkAcls: {
       defaultAction: 'Deny'
       bypass: 'AzureServices'
-      ipRules: [for ip in allowedIpRanges: { value: ip; action: 'Allow' }]
-      virtualNetworkRules: [for subnetId in allowedSubnetIds: { id: subnetId; action: 'Allow' }]
+      ipRules: [for ip in allowedIpRanges: { value: ip, action: 'Allow' }]
+      virtualNetworkRules: [for subnetId in allowedSubnetIds: { id: subnetId, action: 'Allow' }]
     }
     encryption: {
       services: {
-        blob: { enabled: true; keyType: 'Account' }
-        file: { enabled: true; keyType: 'Account' }
+        blob: { enabled: true, keyType: 'Account' }
+        file: { enabled: true, keyType: 'Account' }
       }
       keySource: 'Microsoft.Storage'
     }
@@ -58,8 +58,8 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01'
   parent: storageAccount
   name: 'default'
   properties: {
-    deleteRetentionPolicy: { enabled: true; days: softDeleteDays }
-    containerDeleteRetentionPolicy: { enabled: true; days: softDeleteDays }
+    deleteRetentionPolicy: { enabled: true, days: softDeleteDays }
+    containerDeleteRetentionPolicy: { enabled: true, days: softDeleteDays }
   }
 }
 

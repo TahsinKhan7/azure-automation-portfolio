@@ -63,10 +63,10 @@ resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' 
   properties: {
     workspaceId: logAnalyticsWorkspaceId
     logs: [
-      { category: 'accounts'; enabled: true }
-      { category: 'clusters'; enabled: true }
-      { category: 'jobs'; enabled: true }
-      { category: 'notebook'; enabled: true }
+      { category: 'accounts', enabled: true }
+      { category: 'clusters', enabled: true }
+      { category: 'jobs', enabled: true }
+      { category: 'notebook', enabled: true }
     ]
   }
 }

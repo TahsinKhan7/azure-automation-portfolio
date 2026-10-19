@@ -1,0 +1,142 @@
+# Job: deploy a published Template Spec version to one environment.
+#
+# This is a deployment job, so `environment:` binds it to the Azure DevOps Environment of the
+# same name. Approvals, business-hours checks and exclusive locks configured on that Environment
+# run before any step here executes; the pipeline YAML never needs to know who the approvers are.
+
+parameters:
+  - name: environment
+    type: string
+    values: [dev, ite, iqe, preprod, prod]
+  - name: serviceConnection
+    type: string
+  - name: resourceGroupName
+    type: string
+  - name: location
+    type: string
+    default: 'uksouth'
+  - name: parameterFile
+    type: string
+  - name: templateSpecId
+    type: string            # usually a runtime expression, e.g. $[ dependencies.Validate.outputs['PublishTemplateSpec.templateSpecId'] ]
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: succeeded()
+  - name: vmImage
+    type: string
+    default: 'ubuntu-latest'
+  - name: timeoutInMinutes
+    type: number
+    default: 90
+
+jobs:
+  - deployment: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    environment: '${{ parameters.environment }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+    pool:
+      vmImage: '${{ parameters.vmImage }}'
+    variables:
+      templateSpecId: ${{ parameters.templateSpecId }}
+      deploymentName: 'dp-${{ parameters.environment }}-$(Build.BuildId)'
+      outputsDirectory: '$(Build.ArtifactStagingDirectory)/outputs'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - download: current
+              artifact: arm-templates
+              displayName: 'Download packaged templates'
+
+            - task: AzureCLI@2
+              name: ArmDeploy
+              displayName: 'az deployment group create (${{ parameters.environment }})'
+              inputs:
+                azureSubscription: '${{ parameters.serviceConnection }}'
+                scriptType: bash
+                scriptLocation: inlineScript
+                failOnStandardError: false
+                inlineScript: |
+                  set -euo pipefail
+                  mkdir -p "$(outputsDirectory)"
+
+                  echo "Deployment      : $(deploymentName)"
+                  echo "Resource group  : ${{ parameters.resourceGroupName }}"
+                  echo "Template Spec   : $(templateSpecId)"
+                  echo "Parameter file  : ${{ parameters.parameterFile }}"
+
+                  az group create \
+                    --name "${{ parameters.resourceGroupName }}" \
+                    --location "${{ parameters.location }}" \
+                    --tags platform=dataplatform environment=${{ parameters.environment }} managedBy=pipeline \
+                    --output none
+
+                  # Incremental mode: resources absent from the template are never deleted by the
+                  # deployment itself. Removals are deliberate, reviewed through what-if, and done
+                  # as separate change records.
+                  az deployment group create \
+                    --name "$(deploymentName)" \
+                    --resource-group "${{ parameters.resourceGroupName }}" \
+                    --template-spec "$(templateSpecId)" \
+                    --parameters "@$(Pipeline.Workspace)/arm-templates/${{ parameters.parameterFile }}" \
+                    --mode Incremental \
+                    --query 'properties.outputs' \
+                    --output json > "$(outputsDirectory)/deployment-outputs.json"
+
+                  echo "Deployment outputs:"
+                  jq -r 'to_entries[] | "  \(.key) = \(.value.value | tostring)"' "$(outputsDirectory)/deployment-outputs.json"
+
+                  # Surface scalar outputs as job output variables for downstream stages
+                  # (for example a Databricks configuration stage that needs the workspace URL).
+                  jq -r 'to_entries[] | select(.value.type | test("string|int|bool"; "i")) | "\(.key)=\(.value.value)"' \
+                    "$(outputsDirectory)/deployment-outputs.json" | while IFS='=' read -r key value; do
+                      echo "##vso[task.setvariable variable=${key};isOutput=true]${value}"
+                    done
+
+            - task: AzureCLI@2
+              displayName: 'Post-deployment verification'
+              inputs:
+                azureSubscription: '${{ parameters.serviceConnection }}'
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  state=$(az deployment group show \
+                    --name "$(deploymentName)" \
+                    --resource-group "${{ parameters.resourceGroupName }}" \
+                    --query properties.provisioningState --output tsv)
+                  echo "Provisioning state: ${state}"
+                  [ "${state}" = "Succeeded" ] || { echo "##vso[task.logissue type=error]Deployment finished in state ${state}"; exit 1; }
+
+                  echo "Nested deployments for this run:"
+                  az deployment group list \
+                    --resource-group "${{ parameters.resourceGroupName }}" \
+                    --query "[?contains(name, '$(deploymentName)')].{name:name, state:properties.provisioningState, duration:properties.duration}" \
+                    --output table
+
+                  failed=$(az deployment operation group list \
+                    --name "$(deploymentName)" \
+                    --resource-group "${{ parameters.resourceGroupName }}" \
+                    --query "length([?properties.provisioningState=='Failed'])" --output tsv)
+                  [ "${failed}" = "0" ] || { echo "##vso[task.logissue type=error]${failed} deployment operation(s) failed"; exit 1; }
+
+                  echo "Resources tagged environment=${{ parameters.environment }} in the group:"
+                  az resource list \
+                    --resource-group "${{ parameters.resourceGroupName }}" \
+                    --tag environment=${{ parameters.environment }} \
+                    --query "[].{name:name, type:type}" --output table
+
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish deployment outputs'
+              condition: succeededOrFailed()
+              inputs:
+                targetPath: '$(outputsDirectory)'
+                artifact: 'deployment-outputs-${{ parameters.environment }}'
