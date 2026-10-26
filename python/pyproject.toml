@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "pyspark>=3.5,<4",
+    "pyspark>=4.2.0,<5",
     "delta-spark>=3.2,<4",
     "requests>=2.31",
     "pyyaml>=6.0",
